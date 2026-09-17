@@ -2,7 +2,7 @@
 
 A shared-encoder, two-head recurrent model for next-day directional forecasting on a cross-section of assets — with calibrated probabilities and the option to abstain.
 
-Every input is $\mathcal{F}_t$-measurable, every split is chronological and embargoed, and each structural claim in the design carries a proof. See [`DUAL_HEAD_TLSTM`](rough.md).
+Every input is $\mathcal{F}_t$-measurable, every split is chronological and embargoed, and each structural claim in the design carries a proof. See [`DUAL_HEAD_TLSTM`](MATH.md).
 
 ---
 
