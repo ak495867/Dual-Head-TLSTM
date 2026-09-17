@@ -1,0 +1,103 @@
+Device: cpu
+
+Config: T=30, H=5, hidden=64, λ_B=1.0, λ_C=0.1, κ_0=0.8
+
+[1/8] Downloading data...
+  SPY: 2956 rows
+  QQQ: 2956 rows
+  IWM: 2956 rows
+  DIA: 2956 rows
+  MDY: 2956 rows
+  RSP: 2956 rows
+  VTI: 2956 rows
+  XLE: 2956 rows
+  XLF: 2956 rows
+  XLK: 2956 rows
+  XLV: 2956 rows
+  XLI: 2956 rows
+  XLP: 2956 rows
+  XLY: 2956 rows
+  XLU: 2956 rows
+  XLB: 2956 rows
+  AAPL: 2956 rows
+  MSFT: 2956 rows
+  GOOGL: 2956 rows
+  AMZN: 2956 rows
+  NVDA: 2956 rows
+  META: 2861 rows
+  TSLA: 2956 rows
+  JPM: 2956 rows
+  JNJ: 2956 rows
+  WMT: 2956 rows
+  XOM: 2956 rows
+  BAC: 2956 rows
+  V: 2956 rows
+  UNH: 2956 rows
+  PG: 2956 rows
+  HD: 2956 rows
+  CVX: 2956 rows
+  ABBV: 2706 rows
+  KO: 2956 rows
+  PEP: 2956 rows
+  ORCL: 2956 rows
+  CSCO: 2956 rows
+  Loaded 38 assets
+
+[2/8] Building per-asset windows...
+  Total windows: 110691
+
+[3/8] Calendar-date split with embargo T+H...
+  Train ends at   : 2019-02-28
+  Val  in         : [2019-04-22, 2021-07-02]
+  Test starts at  : 2021-08-24
+  Windows: train=64597, val=21128, test=22306
+
+[4/8] Fitting train-fold scaler and vol scale...
+  Feature scale: mu range [0.000,54.458], sd mean 1.3594
+  Vol scale s_vol = 0.01078
+
+[5/8] Training main dual-head model...
+  Params: 26,891
+  ep   1 | train=0.8695  val=1.1715 *
+  ep   2 | train=0.8135  val=1.1636 *
+  ep   6 | train=0.7952  val=1.2162
+  ep  11 | train=0.7788  val=1.2355
+  ep  16 | train=0.7598  val=1.2876
+  early stop at ep 17
+  Time: 1.5 min | best val loss = 1.1636
+
+[6/8] Computing τ_vol and evaluating on test...
+  τ_vol = Q_0.80(v̂_val) = 1.6496  (in original units: 0.01779)
+  Main model on test:
+    Directional accuracy : 0.5165
+    Volatility corr      : 0.6531
+    Coverage (κ_0=0.8)     : 0.8327
+    Selective accuracy   : 0.5176
+    Non-overlap Sharpe   : -0.053
+
+[7/8] Baselines...
+  B2: single-head (λ_B=λ_C=0)...
+  ep   1 | train=0.6031  val=0.9032 *
+  ep   6 | train=0.5897  val=0.9342
+  ep  11 | train=0.5722  val=0.9467
+  ep  16 | train=0.5585  val=0.9596
+  early stop at ep 16
+  B3: detached Head B...
+  ep   1 | train=0.8790  val=1.1736 *
+  ep   6 | train=0.7945  val=1.2556
+  ep  11 | train=0.7667  val=1.2586
+  ep  16 | train=0.7431  val=1.2973
+  early stop at ep 16
+
+==============================================================================
+Model                                DirAcc  VolCorr     Cov   SelAcc   Sharpe
+------------------------------------------------------------------------------
+Main dual-head                       0.5165   0.6531   0.833   0.5176   -0.053
+Single-head (λ_B=λ_C=0)              0.5166   0.4425   0.812   0.5180    0.038
+Detached Head B                      0.5166   0.6408   0.853   0.5175    0.021
+No abstention (τ=∞)                  0.5165   0.6531   1.000   0.5165   -0.053
+Constant predictor                   0.5166        —       —        —        —
+==============================================================================
+
+Saved checkpoint: dual_head_tlstm_v2.pth
+Saved: dual_head_tlstm_v2.png
