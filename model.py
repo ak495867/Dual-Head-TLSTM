@@ -1,14 +1,17 @@
 """
-Dual-Head TLSTM for Volatility v3.0
+Dual-Head TLSTM for Volatility v3.1
 ====================================
-Head A: distributional log total realized vol
-Head B: log downside semivol (auxiliary)
-Consistency: μ_A ≈ sg[ℓ_B + ½ log 2]
+Fixes applied over v3.0:
+  1. Center Head A's target (log total vol) on training-fold mean
+  2. Standardize Head B's target δ = ℓ^total − ℓ^down on training mean/std
+  3. λ_B = 0.1 (was 1.0) — scale-matched
+  4. λ_C = 0.0 (was 0.2) — consistency term removed (bias confirmed harmful)
+  5. Head B's target is the volatility asymmetry δ, not raw log-downside-vol
 
-Causality (§2), features (§3), scaler (§4.1) unchanged from v2.0.
-Benchmark: HAR-RV (Corsi 2009) — the standard vol baseline.
+Everything else (causality, features, per-asset windows, calendar split,
+embargo) unchanged from v3.0.
 
-Saves: dual_head_tlstm_vol_v3.pth
+Saves: dual_head_tlstm_vol_v3_1.pth
 """
 
 import os, math, time, warnings
@@ -22,6 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.linear_model import LinearRegression
+from scipy.stats import norm
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -32,7 +36,9 @@ if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {DEVICE}")
 
-# ---------- Config ----------
+# ==================================================================
+# Config
+# ==================================================================
 TRAIN_TICKERS = [
     'SPY','QQQ','IWM','DIA','MDY','RSP','VTI',
     'XLE','XLF','XLK','XLV','XLI','XLP','XLY','XLU','XLB',
@@ -43,8 +49,8 @@ TRAIN_TICKERS = [
 START_DATE = '2012-01-01'
 END_DATE   = '2023-12-31'
 
-T          = 30         # window length
-H          = 5          # forecast horizon (trading days)
+T          = 30
+H          = 5
 HIDDEN     = 64
 NUM_LAYERS = 1
 DROPOUT    = 0.1
@@ -54,16 +60,18 @@ BATCH_SIZE = 512
 EPOCHS     = 150
 LR         = 5e-4
 GAMMA      = 1e-5
-LAMBDA_B   = 1.0
-LAMBDA_C   = 0.2
+LAMBDA_B   = 0.1          # FIX 3: was 1.0, now scale-matched
+LAMBDA_C   = 0.0          # FIX 4: consistency term removed
 PATIENCE   = 20
 KAPPA_0    = 0.80
 
-CKPT_PATH  = 'dual_head_tlstm_vol_v3.pth'
-CACHE_DIR  = './cache_v3'
+EPS        = 1e-6
+DELTA_FLOOR= 0.20         # FIX 5: floor v_down at 20% of v_total → δ ≤ log(5) ≈ 1.61
+
+CKPT_PATH  = 'dual_head_tlstm_vol_v3_1.pth'
+CACHE_DIR  = './cache_v3_1'
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# 12 features (§3.3) plus 3 HAR features (used only by baseline)
 FEATURE_COLS = [
     'r1','r5','r20','vol20','vol60','ma5_ratio','ma20_ratio',
     'rsi','vol_pct','vix','vix_pct','tnx_pct',
@@ -71,7 +79,9 @@ FEATURE_COLS = [
 HAR_COLS = ['rv_d','rv_w','rv_m']
 
 
-# ---------- Data ----------
+# ==================================================================
+# Data
+# ==================================================================
 def download_prices(ticker, start, end):
     path = os.path.join(CACHE_DIR, f"{ticker}_{start}_{end}.parquet")
     if os.path.exists(path):
@@ -133,7 +143,6 @@ def compute_features(df, macro):
     Ub = U.ewm(alpha=1/n, adjust=False).mean()
     Db = D.ewm(alpha=1/n, adjust=False).mean()
     f['rsi'] = 100.0 * (1.0 - 1.0 / (1.0 + Ub / (Db + 1e-9)))
-
     f['vol_pct'] = volume / (volume.rolling(20).mean() + 1e-9) - 1.0
 
     macro_ff = macro.reindex(f.index, method='ffill')
@@ -141,24 +150,26 @@ def compute_features(df, macro):
     f['vix_pct'] = macro_ff['vix'].pct_change(1)
     f['tnx_pct'] = macro_ff['tnx'].pct_change(1)
 
-    # HAR features (Corsi 2009), daily squared-return proxies
     r2 = f['r1'] ** 2
     f['rv_d'] = r2
     f['rv_w'] = r2.rolling(5).mean()
     f['rv_m'] = r2.rolling(22).mean()
 
-    f['log_ret'] = f['r1']   # for target construction
-
+    f['log_ret'] = f['r1']
     f = f.replace([np.inf, -np.inf], np.nan).dropna()
     return f
 
 
 def build_windows_for_asset(feat, T, H, asset_id):
     """
-    Per-asset windows (§2.5). Returns list of dicts.
-    Targets:
-      v_total = sqrt( mean_{h=1..H} r_{t+h}^2 )
-      v_down  = sqrt( mean_{h=1..H} min(r_{t+h},0)^2 )
+    FIX 5 — δ target with floor on v_down.
+
+    v_total = sqrt( mean_{h=1..H} r_{t+h}^2 )
+    v_down  = sqrt( mean_{h=1..H} min(r_{t+h},0)^2 )
+    v_down_floored = max(v_down, DELTA_FLOOR * v_total + 1e-8)
+    ℓ^total = log(v_total + ε)
+    ℓ^down  = log(v_down_floored + ε)
+    δ       = ℓ^total − ℓ^down   ∈ [0, log(1/DELTA_FLOOR)]
     """
     X_all   = feat[FEATURE_COLS].values
     har_all = feat[HAR_COLS].values
@@ -173,17 +184,23 @@ def build_windows_for_asset(feat, T, H, asset_id):
         v_tot = float(np.sqrt(np.mean(r * r)))
         r_dn  = np.minimum(r, 0.0)
         v_dn  = float(np.sqrt(np.mean(r_dn * r_dn)))
+        v_dn_f = max(v_dn, DELTA_FLOOR * v_tot + 1e-8)
+        l_tot = float(np.log(v_tot + EPS))
+        l_dn  = float(np.log(v_dn_f + EPS))
+        delta = l_tot - l_dn                                  # ∈ [0, 1.61]
         out.append({
             'X': Xw, 'har': harw,
-            'v_total': v_tot, 'v_down': v_dn,
+            'v_total': v_tot, 'v_down': v_dn_f,
+            'l_total': l_tot, 'l_down': l_dn, 'delta': delta,
             'date': dates[i], 'asset': asset_id,
         })
     return out
 
 
-# ---------- Model ----------
+# ==================================================================
+# Model  (unchanged from v3.0)
+# ==================================================================
 class DualHeadTLSTMVol(nn.Module):
-    """§7: Head A returns (μ, log σ) for log-vol. §8: Head B returns ℓ̂_down."""
     def __init__(self, n_features, hidden=64, num_layers=1,
                  dropout=0.1, c_sigma=6.0):
         super().__init__()
@@ -194,9 +211,9 @@ class DualHeadTLSTMVol(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.head_a = nn.Sequential(
             nn.Linear(hidden, 64), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(64, 2))    # (μ, log σ)
+            nn.Dropout(dropout), nn.Linear(64, 2))      # (μ_A, log σ_A)
         self.head_b = nn.Sequential(
-            nn.Linear(hidden, 32), nn.GELU(), nn.Linear(32, 1))
+            nn.Linear(hidden, 32), nn.GELU(), nn.Linear(32, 1))  # δ̂ (std)
 
     def forward(self, x, detach_b=False):
         out, _ = self.lstm(x)
@@ -205,13 +222,14 @@ class DualHeadTLSTMVol(nn.Module):
         mu    = a[:, 0]
         log_s = torch.clamp(a[:, 1], -self.c_sigma, self.c_sigma)
         h_b   = h.detach() if detach_b else h
-        l_dn  = self.head_b(h_b).squeeze(-1)
-        return mu, log_s, l_dn
+        d_std = self.head_b(h_b).squeeze(-1)                 # standardized δ̂
+        return mu, log_s, d_std
 
 
-# ---------- Losses ----------
+# ==================================================================
+# Losses
+# ==================================================================
 def crps_gaussian_scalar(y, mu, log_sigma):
-    """Gaussian CRPS on a scalar target (§9.1)."""
     sigma = torch.exp(log_sigma).clamp(min=1e-6)
     z   = (y - mu) / sigma
     phi = torch.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
@@ -219,49 +237,52 @@ def crps_gaussian_scalar(y, mu, log_sigma):
     return sigma * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
 
 
-def composite_loss(mu, log_s, l_dn, l_total, l_down, lam_B, lam_C):
-    # §9.5 Head A: CRPS on log total vol
-    L_A = crps_gaussian_scalar(l_total, mu, log_s).mean()
-    # §9.8 Head B: MSE on log downside semivol
-    L_B = F.mse_loss(l_dn, l_down)
-    # §9.9 Consistency: μ_A ≈ sg[ℓ_down + ½ log 2]
-    if lam_C > 0:
-        L_C = F.mse_loss(mu, (l_dn.detach() + 0.5 * math.log(2.0)))
-    else:
-        L_C = torch.tensor(0.0, device=mu.device)
-    total = L_A + lam_B * L_B + lam_C * L_C
-    return total, float(L_A), float(L_B), float(L_C)
+def composite_loss_v3_1(mu, log_s, d_std, l_total_c, delta_std, lam_B):
+    """
+    L_A = CRPS( N(μ_A, σ_A²), ℓ^total_centered )   [FIX 1]
+    L_B = MSE( δ̂_std, δ_std )                     [FIX 2, FIX 5]
+    L_total = L_A + λ_B · L_B                      [FIX 3, FIX 4]
+    """
+    L_A = crps_gaussian_scalar(l_total_c, mu, log_s).mean()
+    L_B = F.mse_loss(d_std, delta_std)
+    total = L_A + lam_B * L_B
+    return total, float(L_A), float(L_B)
 
 
-# ---------- Training ----------
-def train_model(model, train_loader, val_loader, lam_B, lam_C,
-                epochs, lr, gamma, patience, detach_b=False):
+# ==================================================================
+# Training
+# ==================================================================
+def train_model_v3_1(model, train_loader, val_loader, lam_B,
+                     epochs, lr, gamma, patience, detach_b=False):
     opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=gamma)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     best_val, best_state, wait = float('inf'), None, 0
-    history = {'train': [], 'val': []}
+    history = {'train': [], 'val': [], 'L_A': [], 'L_B': []}
 
     for ep in range(epochs):
         model.train()
-        tot, n = 0.0, 0
-        for xb, ltb, ldb in train_loader:
-            xb, ltb, ldb = xb.to(DEVICE), ltb.to(DEVICE), ldb.to(DEVICE)
-            mu, ls, lv = model(xb, detach_b=detach_b)
-            loss, _, _, _ = composite_loss(mu, ls, lv, ltb, ldb, lam_B, lam_C)
+        tot, tot_a, tot_b, n = 0.0, 0.0, 0.0, 0
+        for xb, lt_c, dt_s in train_loader:
+            xb, lt_c, dt_s = xb.to(DEVICE), lt_c.to(DEVICE), dt_s.to(DEVICE)
+            mu, ls, dv = model(xb, detach_b=detach_b)
+            loss, la, lb = composite_loss_v3_1(mu, ls, dv, lt_c, dt_s, lam_B)
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            tot += loss.item() * len(xb); n += len(xb)
-        train_loss = tot / n
+            tot += loss.item() * len(xb); tot_a += la * len(xb)
+            tot_b += lb * len(xb); n += len(xb)
+        train_loss = tot / n; train_LA = tot_a / n; train_LB = tot_b / n
         history['train'].append(train_loss)
+        history['L_A'].append(train_LA)
+        history['L_B'].append(train_LB)
 
         model.eval()
         tot, n = 0.0, 0
         with torch.no_grad():
-            for xb, ltb, ldb in val_loader:
-                xb, ltb, ldb = xb.to(DEVICE), ltb.to(DEVICE), ldb.to(DEVICE)
-                mu, ls, lv = model(xb, detach_b=detach_b)
-                loss, _, _, _ = composite_loss(mu, ls, lv, ltb, ldb, lam_B, lam_C)
+            for xb, lt_c, dt_s in val_loader:
+                xb, lt_c, dt_s = xb.to(DEVICE), lt_c.to(DEVICE), dt_s.to(DEVICE)
+                mu, ls, dv = model(xb, detach_b=detach_b)
+                loss, _, _ = composite_loss_v3_1(mu, ls, dv, lt_c, dt_s, lam_B)
                 tot += loss.item() * len(xb); n += len(xb)
         val_loss = tot / n
         history['val'].append(val_loss)
@@ -274,9 +295,11 @@ def train_model(model, train_loader, val_loader, lam_B, lam_C,
             wait = 0
         else:
             wait += 1
+
         if ep % 10 == 0 or improved:
-            print(f"  ep {ep+1:3d} | train={train_loss:.4f}  val={val_loss:.4f}"
-                  f"{' *' if improved else ''}")
+            print(f"  ep {ep+1:3d} | train={train_loss:.4f} "
+                  f"(LA={train_LA:.4f} LB={train_LB:.4f}) "
+                  f"val={val_loss:.4f}{' *' if improved else ''}")
         if wait >= patience:
             print(f"  early stop ep {ep+1}")
             break
@@ -288,28 +311,28 @@ def train_model(model, train_loader, val_loader, lam_B, lam_C,
 
 @torch.no_grad()
 def predict(model, X, detach_b=False, bs=2048):
+    """Returns (μ_A on centered scale, σ_A, δ̂_std)."""
     model.eval()
     Xt = torch.as_tensor(X, dtype=torch.float32)
-    mus, sigs, lvs = [], [], []
+    mus, sigs, dvs = [], [], []
     for i in range(0, len(Xt), bs):
         xb = Xt[i:i+bs].to(DEVICE)
-        mu, ls, lv = model(xb, detach_b=detach_b)
+        mu, ls, dv = model(xb, detach_b=detach_b)
         mus.append(mu.cpu().numpy())
         sigs.append(torch.exp(ls).cpu().numpy())
-        lvs.append(lv.cpu().numpy())
-    return np.concatenate(mus), np.concatenate(sigs), np.concatenate(lvs)
+        dvs.append(dv.cpu().numpy())
+    return (np.concatenate(mus), np.concatenate(sigs), np.concatenate(dvs))
 
 
-# ---------- Metrics ----------
+# ==================================================================
+# Metrics
+# ==================================================================
 def qlike(l_true, mu_pred):
-    """QLIKE: exp(u) - u - 1 with u = ℓ_true - μ. Minimized at 0, penalizes underestimation."""
     u = l_true - mu_pred
     return float((np.exp(u) - u - 1.0).mean())
 
 
-def gauss_interval_coverage(l_true, mu, sigma, level):
-    """Empirical coverage of the Gaussian [level]-interval on log-vol."""
-    from scipy.stats import norm
+def gauss_coverage(l_true, mu, sigma, level):
     z = norm.ppf(0.5 + level / 2.0)
     lo, hi = mu - z * sigma, mu + z * sigma
     return float(((l_true >= lo) & (l_true <= hi)).mean())
@@ -317,15 +340,17 @@ def gauss_interval_coverage(l_true, mu, sigma, level):
 
 def full_metrics(l_true, mu_pred, sigma_pred, v_true, label):
     crps = float(crps_gaussian_scalar(
-        torch.tensor(l_true), torch.tensor(mu_pred), torch.log(torch.tensor(sigma_pred))
+        torch.tensor(l_true, dtype=torch.float32),
+        torch.tensor(mu_pred, dtype=torch.float32),
+        torch.log(torch.tensor(sigma_pred, dtype=torch.float32).clamp(min=1e-6))
     ).mean())
     pearson  = float(np.corrcoef(np.exp(mu_pred), v_true)[0, 1])
     spearman = float(pd.Series(mu_pred).corr(pd.Series(l_true), method='spearman'))
     ql       = qlike(l_true, mu_pred)
     mse_log  = float(np.mean((mu_pred - l_true) ** 2))
-    cov80    = gauss_interval_coverage(l_true, mu_pred, sigma_pred, 0.80)
-    cov95    = gauss_interval_coverage(l_true, mu_pred, sigma_pred, 0.95)
-    print(f"  {label:<30} CRPS={crps:.4f}  ρ={pearson:.4f}  ρ_s={spearman:.4f}  "
+    cov80    = gauss_coverage(l_true, mu_pred, sigma_pred, 0.80)
+    cov95    = gauss_coverage(l_true, mu_pred, sigma_pred, 0.95)
+    print(f"  {label:<28} CRPS={crps:.4f}  ρ={pearson:.4f}  ρ_s={spearman:.4f}  "
           f"QLIKE={ql:.4f}  MSE_ℓ={mse_log:.4f}  cov80={cov80:.3f}  cov95={cov95:.3f}")
     return dict(crps=crps, pearson=pearson, spearman=spearman,
                 qlike=ql, mse_log=mse_log, cov80=cov80, cov95=cov95)
@@ -337,6 +362,11 @@ def full_metrics(l_true, mu_pred, sigma_pred, v_true, label):
 def main():
     print(f"\nConfig: T={T}, H={H}, hidden={HIDDEN}, "
           f"λ_B={LAMBDA_B}, λ_C={LAMBDA_C}")
+    print(f"FIX 1: Head A target centered on train mean")
+    print(f"FIX 2: Head B target = δ = ℓ^total − ℓ^down, standardized")
+    print(f"FIX 3: λ_B = {LAMBDA_B} (scale-matched)")
+    print(f"FIX 4: λ_C = {LAMBDA_C} (consistency term removed)")
+    print(f"FIX 5: δ computed with v_down floor = {DELTA_FLOOR}·v_total")
 
     # ---------- Data ----------
     print("\n[1/7] Downloading data...")
@@ -358,7 +388,7 @@ def main():
         all_w.extend(build_windows_for_asset(feat, T, H, tk))
     print(f"  Total windows: {len(all_w)}")
 
-    # ---------- Calendar split with embargo ----------
+    # ---------- Split ----------
     print("\n[3/7] Calendar-date split (embargo T+H)...")
     master = sorted(assets['SPY'].index)
     m = len(master)
@@ -372,12 +402,10 @@ def main():
     train_w = [w for w in all_w if w['date'] <= train_end_date]
     val_w   = [w for w in all_w if val_start_date <= w['date'] <= val_end_date]
     test_w  = [w for w in all_w if w['date'] >= test_start_date]
-    print(f"  Train ends {train_end_date.date()}, val in "
-          f"[{val_start_date.date()}, {val_end_date.date()}], "
+    print(f"  Train ends {train_end_date.date()}, "
+          f"val [{val_start_date.date()}, {val_end_date.date()}], "
           f"test from {test_start_date.date()}")
     print(f"  Windows: train={len(train_w)}, val={len(val_w)}, test={len(test_w)}")
-
-    def stack(ws, key): return np.array([w[key] for w in ws], dtype=np.float32)
 
     train_X   = np.stack([w['X'] for w in train_w]).astype(np.float32)
     val_X     = np.stack([w['X'] for w in val_w]).astype(np.float32)
@@ -391,32 +419,50 @@ def main():
     val_vt    = np.array([w['v_total'] for w in val_w], dtype=np.float32)
     test_vt   = np.array([w['v_total'] for w in test_w], dtype=np.float32)
 
-    train_vd  = np.array([w['v_down'] for w in train_w], dtype=np.float32)
-    val_vd    = np.array([w['v_down'] for w in val_w], dtype=np.float32)
-    test_vd   = np.array([w['v_down'] for w in test_w], dtype=np.float32)
+    train_lt  = np.array([w['l_total'] for w in train_w], dtype=np.float32)
+    val_lt    = np.array([w['l_total'] for w in val_w], dtype=np.float32)
+    test_lt   = np.array([w['l_total'] for w in test_w], dtype=np.float32)
 
-    # ---------- Log targets ----------
-    EPS = 1e-6
-    train_lt = np.log(train_vt + EPS); val_lt = np.log(val_vt + EPS); test_lt = np.log(test_vt + EPS)
-    train_ld = np.log(train_vd + EPS); val_ld = np.log(val_vd + EPS); test_ld = np.log(test_vd + EPS)
+    train_ld  = np.array([w['l_down'] for w in train_w], dtype=np.float32)
+    val_ld    = np.array([w['l_down'] for w in val_w], dtype=np.float32)
+    test_ld   = np.array([w['l_down'] for w in test_w], dtype=np.float32)
 
-    # ---------- Standardize features on train ----------
-    print("\n[4/7] Fitting train-fold scaler...")
+    train_d   = np.array([w['delta'] for w in train_w], dtype=np.float32)
+    val_d     = np.array([w['delta'] for w in val_w], dtype=np.float32)
+    test_d    = np.array([w['delta'] for w in test_w], dtype=np.float32)
+
+    # ---------- FIX 1: center Head A target ----------
+    l_total_mean = float(train_lt.mean())
+    train_lt_c   = train_lt - l_total_mean
+    val_lt_c     = val_lt   - l_total_mean
+    test_lt_c    = test_lt  - l_total_mean
+    print(f"\n[4/7] Target statistics (train fold):")
+    print(f"  ℓ^total: mean={l_total_mean:.4f}, std={train_lt.std():.4f}")
+    print(f"  δ      : mean={train_d.mean():.4f}, std={train_d.std():.4f}, "
+          f"min={train_d.min():.4f}, max={train_d.max():.4f}")
+
+    # ---------- FIX 2: standardize δ ----------
+    delta_mean = float(train_d.mean())
+    delta_std  = float(train_d.std() + 1e-8)
+    train_d_std = (train_d - delta_mean) / delta_std
+    val_d_std   = (val_d   - delta_mean) / delta_std
+    test_d_std  = (test_d  - delta_mean) / delta_std
+
+    # ---------- Feature scaler ----------
     mu_f = train_X.mean(axis=(0, 1)).astype(np.float32)
     sd_f = (train_X.std(axis=(0, 1)) + 1e-8).astype(np.float32)
     train_X = (train_X - mu_f) / sd_f
     val_X   = (val_X   - mu_f) / sd_f
     test_X  = (test_X  - mu_f) / sd_f
-    print(f"  Scaler fit on {len(train_X)} windows")
 
     # ---------- Loaders ----------
     train_loader = DataLoader(
-        TensorDataset(torch.tensor(train_X), torch.tensor(train_lt),
-                      torch.tensor(train_ld)),
+        TensorDataset(torch.tensor(train_X), torch.tensor(train_lt_c),
+                      torch.tensor(train_d_std)),
         batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(
-        TensorDataset(torch.tensor(val_X), torch.tensor(val_lt),
-                      torch.tensor(val_ld)),
+        TensorDataset(torch.tensor(val_X), torch.tensor(val_lt_c),
+                      torch.tensor(val_d_std)),
         batch_size=BATCH_SIZE, shuffle=False)
 
     # ---------- HAR baseline ----------
@@ -425,79 +471,98 @@ def main():
     Xh_va = np.log(val_har + EPS)
     Xh_te = np.log(test_har + EPS)
     har = LinearRegression().fit(Xh_tr, train_lt)
-    har_val_pred  = har.predict(Xh_va)
     har_test_pred = har.predict(Xh_te)
-    # HAR variance = residual variance on train
-    har_val_sigma = np.full(len(har_val_pred), np.std(train_lt - har.predict(Xh_tr)))
-    har_test_sigma = np.full(len(har_test_pred), har_val_sigma[0])
+    har_train_resid = train_lt - har.predict(Xh_tr)
+    har_sigma = float(har_train_resid.std())
+    har_test_sigma = np.full(len(har_test_pred), har_sigma)
     print(f"  HAR coefs: {har.coef_}, intercept={har.intercept_:.4f}")
-    print(f"  HAR train R²: {har.score(Xh_tr, train_lt):.4f}")
+    print(f"  HAR train R²: {har.score(Xh_tr, train_lt):.4f}, "
+          f"residual σ: {har_sigma:.4f}")
 
-    # ---------- Train main model ----------
-    print("\n[6/7] Training main Dual-Head TLSTM (vol)...")
+    # ---------- Train main ----------
+    print("\n[6/7] Training main Dual-Head TLSTM (v3.1)...")
     model = DualHeadTLSTMVol(len(FEATURE_COLS), HIDDEN, NUM_LAYERS,
                              DROPOUT, C_SIGMA).to(DEVICE)
     print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
     t0 = time.time()
-    hist_main, best_val = train_model(
+    hist_main, best_val = train_model_v3_1(
         model, train_loader, val_loader,
-        LAMBDA_B, LAMBDA_C, EPOCHS, LR, GAMMA, PATIENCE, detach_b=False)
+        LAMBDA_B, EPOCHS, LR, GAMMA, PATIENCE, detach_b=False)
     print(f"  Time: {(time.time()-t0)/60:.1f} min | best val = {best_val:.4f}")
 
-    # ---------- Test predictions ----------
+    # ---------- Test predictions (de-standardize) ----------
     print("\n[7/7] Evaluating on test...")
-    test_mu, test_sig, test_ldn = predict(model, test_X)
+    test_mu_c, test_sig, test_d_std = predict(model, test_X)
+    test_mu   = test_mu_c + l_total_mean               # uncenter Head A
+    test_d_hat = test_d_std * delta_std + delta_mean   # unstandardize δ̂
+    # Consistency reconstruction (for reporting, not for the loss)
+    test_l_down_hat = test_mu - test_d_hat
 
     # ---------- Baselines ----------
-    # B1: constant (train mean log vol)
-    const_mu = np.full(len(test_lt), train_lt.mean())
-    const_sig = np.full(len(test_lt), train_lt.std())
+    # B1: constant
+    const_mu    = np.full(len(test_lt), l_total_mean)
+    const_sig   = np.full(len(test_lt), float(train_lt.std()))
 
-    # B3: single-head
-    print("\n  Training single-head baseline (λ_B=λ_C=0)...")
+    # B3: single-head (λ_B = 0)
+    print("\n  Training single-head baseline (λ_B=0)...")
     torch.manual_seed(SEED); np.random.seed(SEED)
     m_sh = DualHeadTLSTMVol(len(FEATURE_COLS), HIDDEN, NUM_LAYERS,
                             DROPOUT, C_SIGMA).to(DEVICE)
-    train_model(m_sh, train_loader, val_loader,
-                0.0, 0.0, EPOCHS, LR, GAMMA, PATIENCE, detach_b=False)
-    sh_mu, sh_sig, _ = predict(m_sh, test_X)
+    train_model_v3_1(m_sh, train_loader, val_loader,
+                     0.0, EPOCHS, LR, GAMMA, PATIENCE, detach_b=False)
+    sh_mu_c, sh_sig, _ = predict(m_sh, test_X)
+    sh_mu = sh_mu_c + l_total_mean
 
     # B4: detached Head B
     print("  Training detached Head B baseline...")
     torch.manual_seed(SEED); np.random.seed(SEED)
     m_dt = DualHeadTLSTMVol(len(FEATURE_COLS), HIDDEN, NUM_LAYERS,
                             DROPOUT, C_SIGMA).to(DEVICE)
-    train_model(m_dt, train_loader, val_loader,
-                LAMBDA_B, LAMBDA_C, EPOCHS, LR, GAMMA, PATIENCE, detach_b=True)
-    dt_mu, dt_sig, _ = predict(m_dt, test_X, detach_b=True)
+    train_model_v3_1(m_dt, train_loader, val_loader,
+                     LAMBDA_B, EPOCHS, LR, GAMMA, PATIENCE, detach_b=True)
+    dt_mu_c, dt_sig, dt_d_std = predict(m_dt, test_X, detach_b=True)
+    dt_mu = dt_mu_c + l_total_mean
 
     # ---------- Metrics ----------
     print("\n" + "=" * 110)
-    print(f"{'Model':<30} {'CRPS':>8} {'Pearson':>9} {'Spear':>8} "
+    print(f"{'Model':<28} {'CRPS':>8} {'Pearson':>9} {'Spear':>8} "
           f"{'QLIKE':>8} {'MSE_ℓ':>8} {'cov80':>7} {'cov95':>7}")
     print("-" * 110)
     res = {}
-    res['Main dual-head'] = full_metrics(test_lt, test_mu, test_sig, test_vt, 'Main dual-head')
-    res['HAR-RV']         = full_metrics(test_lt, har_test_pred, har_test_sigma, test_vt, 'HAR-RV (Corsi)')
-    res['Single-head']    = full_metrics(test_lt, sh_mu, sh_sig, test_vt, 'Single-head')
-    res['Detached Head B']= full_metrics(test_lt, dt_mu, dt_sig, test_vt, 'Detached Head B')
-    res['Constant']       = full_metrics(test_lt, const_mu, const_sig, test_vt, 'Constant')
+    res['Main dual-head']  = full_metrics(test_lt, test_mu, test_sig,
+                                          test_vt, 'Main dual-head')
+    res['HAR-RV']          = full_metrics(test_lt, har_test_pred, har_test_sigma,
+                                          test_vt, 'HAR-RV (Corsi)')
+    res['Single-head']     = full_metrics(test_lt, sh_mu, sh_sig,
+                                          test_vt, 'Single-head')
+    res['Detached Head B'] = full_metrics(test_lt, dt_mu, dt_sig,
+                                          test_vt, 'Detached Head B')
+    res['Constant']        = full_metrics(test_lt, const_mu, const_sig,
+                                          test_vt, 'Constant')
     print("=" * 110)
 
+    # ---------- Δ vs single-head ----------
+    print("\nDelta vs Single-head (negative = better):")
+    for name in ['Main dual-head', 'HAR-RV', 'Detached Head B']:
+        dc = res[name]['crps']    - res['Single-head']['crps']
+        dq = res[name]['qlike']   - res['Single-head']['qlike']
+        print(f"  {name:<22} ΔCRPS={dc:+.4f}  ΔQLIKE={dq:+.4f}")
+
     # ---------- Abstention diagnostic ----------
-    val_mu, val_sig, _ = predict(model, val_X)
+    val_mu_c, val_sig, _ = predict(model, val_X)
     tau_sigma = float(np.quantile(val_sig, KAPPA_0))
     act = test_sig <= tau_sigma
     print(f"\nAbstention diagnostic (τ_σ = q80 val = {tau_sigma:.4f}):")
     print(f"  Coverage: {act.mean():.3f}")
     if act.sum() > 10:
-        conf_metrics = full_metrics(test_lt[act], test_mu[act], test_sig[act],
-                                    test_vt[act], 'Confident subset')
-        unc_metrics  = full_metrics(test_lt[~act], test_mu[~act], test_sig[~act],
-                                    test_vt[~act], 'Uncertain subset')
-        print(f"  → σ̂ correctly identifies easy vs hard windows"
-              if conf_metrics['crps'] < unc_metrics['crps'] else
-              f"  → σ̂ does NOT separate easy from hard")
+        c_conf = full_metrics(test_lt[act],  test_mu[act],
+                              test_sig[act],  test_vt[act], 'Confident subset')
+        c_unc  = full_metrics(test_lt[~act], test_mu[~act],
+                              test_sig[~act], test_vt[~act], 'Uncertain subset')
+        if c_conf['crps'] < c_unc['crps']:
+            print(f"  ✓ σ̂ separates easy from hard windows")
+        else:
+            print(f"  ✗ σ̂ does NOT separate easy from hard windows")
 
     # ---------- Save ----------
     torch.save({
@@ -506,11 +571,16 @@ def main():
             'n_features': len(FEATURE_COLS), 'hidden': HIDDEN,
             'num_layers': NUM_LAYERS, 'dropout': DROPOUT,
             'window': T, 'horizon': H, 'c_sigma': C_SIGMA,
+            'lambda_B': LAMBDA_B, 'lambda_C': LAMBDA_C,
+            'delta_floor': DELTA_FLOOR,
         },
         'feature_cols': FEATURE_COLS,
         'mu_f': mu_f, 'sd_f': sd_f, 'eps': EPS,
+        'l_total_mean': l_total_mean,
+        'delta_mean':  delta_mean,
+        'delta_std':   delta_std,
         'har_coef': har.coef_, 'har_intercept': har.intercept_,
-        'har_sigma': float(har_val_sigma[0]),
+        'har_sigma': har_sigma,
         'history': hist_main,
         'test_metrics': res,
     }, CKPT_PATH)
@@ -520,43 +590,46 @@ def main():
     fig = plt.figure(figsize=(20, 12))
     gs  = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.30)
 
-    # 1. Loss curves
+    # 1. Loss curves (train/val + components)
     ax = fig.add_subplot(gs[0, 0])
-    ax.plot(hist_main['train'], label='train')
-    ax.plot(hist_main['val'], label='val')
-    ax.set(xlabel='epoch', ylabel='loss', title='Loss (main model)')
+    ax.plot(hist_main['train'], label='total train')
+    ax.plot(hist_main['val'],   label='total val')
+    ax.plot(hist_main['L_A'],   label='L_A',   alpha=0.6)
+    ax.plot(hist_main['L_B'],   label='L_B',   alpha=0.6)
+    ax.set(xlabel='epoch', ylabel='loss', title='Loss curves (v3.1)')
     ax.legend(); ax.grid(alpha=0.3)
 
-    # 2. Predicted vs realized (log space)
+    # 2. Predicted vs realized (log-vol)
     ax = fig.add_subplot(gs[0, 1])
     ax.scatter(test_mu, test_lt, s=2, alpha=0.2)
     lim = [min(test_mu.min(), test_lt.min()),
            max(test_mu.max(), test_lt.max())]
     ax.plot(lim, lim, 'r--', lw=1)
-    ax.set(xlabel='μ̂ (pred log-vol)', ylabel='ℓ^total (realized log-vol)',
+    ax.set(xlabel='μ̂_A (pred log total vol)',
+           ylabel='ℓ^total (realized)',
            title=f'Log-vol scatter (ρ={res["Main dual-head"]["pearson"]:.3f})')
     ax.grid(alpha=0.3)
 
-    # 3. Reliability: interval coverage
+    # 3. Interval coverage
     ax = fig.add_subplot(gs[0, 2])
     levels = np.array([0.10, 0.20, 0.30, 0.50, 0.70, 0.80, 0.90, 0.95])
-    covs = [gauss_interval_coverage(test_lt, test_mu, test_sig, lv) for lv in levels]
+    covs = [gauss_coverage(test_lt, test_mu, test_sig, lv) for lv in levels]
     ax.plot(levels, covs, 'o-', label='Empirical')
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.4, label='Ideal')
     ax.set(xlabel='Nominal coverage', ylabel='Empirical coverage',
            title='Interval calibration')
     ax.legend(); ax.grid(alpha=0.3)
 
-    # 4. CRPS by predicted-vol decile (does σ̂ identify hard cases?)
+    # 4. CRPS by σ decile
     ax = fig.add_subplot(gs[1, 0])
     order = np.argsort(test_sig)
     deciles = np.array_split(order, 10)
     crps_per_decile = []
     for d in deciles:
         c = crps_gaussian_scalar(
-            torch.tensor(test_lt[d]),
-            torch.tensor(test_mu[d]),
-            torch.log(torch.tensor(test_sig[d]))
+            torch.tensor(test_lt[d], dtype=torch.float32),
+            torch.tensor(test_mu[d], dtype=torch.float32),
+            torch.log(torch.tensor(test_sig[d], dtype=torch.float32).clamp(min=1e-6))
         ).mean().item()
         crps_per_decile.append(c)
     ax.bar(range(1, 11), crps_per_decile, color='tab:purple')
@@ -567,7 +640,7 @@ def main():
     # 5. Model comparison table
     ax = fig.add_subplot(gs[1, 1]); ax.axis('off')
     rows = []
-    for name in ['Main dual-head', 'HAR-RV', 'Single-head',
+    for name in ['Main dual-head', 'Single-head', 'HAR-RV',
                  'Detached Head B', 'Constant']:
         r = res[name]
         rows.append([name, f"{r['crps']:.4f}", f"{r['pearson']:.4f}",
@@ -575,7 +648,7 @@ def main():
     cols = ['Model', 'CRPS', 'ρ', 'QLIKE', 'MSE_ℓ']
     t = ax.table(cellText=rows, colLabels=cols, loc='center', cellLoc='center')
     t.auto_set_font_size(False); t.set_fontsize(9); t.scale(1.1, 1.5)
-    ax.set_title('Test metrics', pad=10)
+    ax.set_title('Test metrics (v3.1)', pad=10)
 
     # 6. Per-asset Pearson
     ax = fig.add_subplot(gs[1, 2])
@@ -590,16 +663,16 @@ def main():
     colors = ['tab:red' if v < 0.5 else 'tab:green' for v in vals]
     ax.barh(names, vals, color=colors)
     ax.axvline(0.5, ls='--', color='gray')
-    ax.set(xlabel='Pearson ρ(exp(μ̂), v^total)',
+    ax.set(xlabel='Pearson ρ(exp(μ̂_A), v^total)',
            title='Per-asset Pearson correlation')
     ax.grid(alpha=0.3)
 
-    plt.suptitle(f'Dual-Head TLSTM Vol v3.0 — {len(assets)} assets, '
+    plt.suptitle(f'Dual-Head TLSTM Vol v3.1 — {len(assets)} assets, '
                  f'T={T}, H={H}, λ_B={LAMBDA_B}, λ_C={LAMBDA_C}',
                  fontsize=13, y=0.995)
-    plt.savefig('dual_head_tlstm_vol_v3.png', dpi=120, bbox_inches='tight')
+    plt.savefig('dual_head_tlstm_vol_v3_1.png', dpi=120, bbox_inches='tight')
     plt.close()
-    print("Saved: dual_head_tlstm_vol_v3.png")
+    print("Saved: dual_head_tlstm_vol_v3_1.png")
 
 
 if __name__ == "__main__":
