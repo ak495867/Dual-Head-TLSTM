@@ -1,0 +1,102 @@
+Device: cpu
+
+[1/7] Downloading macro series...
+  Macro: (3522, 2), columns=['vix', 'tnx']
+
+[2/7] Downloading 40 training assets...
+  SPY: 3457 rows
+  QQQ: 3457 rows
+  IWM: 3457 rows
+  DIA: 3457 rows
+  MDY: 3457 rows
+  RSP: 3457 rows
+  VTI: 3457 rows
+  XLE: 3457 rows
+  XLF: 3457 rows
+  XLK: 3457 rows
+  XLV: 3457 rows
+  XLI: 3457 rows
+  XLP: 3457 rows
+  XLY: 3457 rows
+  XLU: 3457 rows
+  XLB: 3457 rows
+  XLRE: 2008 rows
+  XLC: 1332 rows
+  AAPL: 3457 rows
+  MSFT: 3457 rows
+  GOOGL: 3457 rows
+  AMZN: 3457 rows
+  NVDA: 3457 rows
+  META: 2860 rows
+  TSLA: 3335 rows
+  JPM: 3457 rows
+  JNJ: 3457 rows
+  WMT: 3457 rows
+  XOM: 3457 rows
+  BAC: 3457 rows
+  V: 3457 rows
+  UNH: 3457 rows
+  PG: 3457 rows
+  HD: 3457 rows
+  CVX: 3457 rows
+  ABBV: 2705 rows
+  KO: 3457 rows
+  PEP: 3457 rows
+  ORCL: 3457 rows
+  CSCO: 3457 rows
+
+  Loaded 40 training assets
+
+  Common date range: 2018-09-13 to 2023-12-28
+  Pooled scaler fit on 30760 rows across 40 assets
+  Folds: train=[0, 769], val=[800, 1035], test=[1066, 1331]
+  Windows: train=(29600, 30, 14) val=(9400, 30, 14) test=(10640, 30, 14)
+  Train pos rate: 0.5435
+  Val   pos rate: 0.4887
+  Test  pos rate: 0.5316
+
+[3/7] Training 3-seed ensemble...
+  seed 0: best_val_loss=0.9078  val_auc=0.5081  time=121.8s
+  seed 1: best_val_loss=0.9084  val_auc=0.5078  time=124.7s
+  seed 2: best_val_loss=0.9091  val_auc=0.5077  time=107.6s
+
+  Val Brier  raw=0.2501  cal=0.2495
+  Val ECE    raw=0.0149  cal=0.0000
+
+[4/7] Zero-shot test across 22 unseen assets...
+
+
+  USO   n= 1303  acc=0.5357  auc=0.5006  brier=0.2509  cov=0.031  sel_acc=0.6000
+  UNG   n= 1303  acc=0.4850  auc=0.5093  brier=0.2501  cov=0.040  sel_acc=0.4038
+  TLT   n= 1303  acc=0.5081  auc=0.4710  brier=0.2516  cov=0.028  sel_acc=0.4722
+
+
+
+  LQD   n= 1303  acc=0.5326  auc=0.4859  brier=0.2525  cov=0.005  sel_acc=0.7143
+  EMB   n= 1303  acc=0.5288  auc=0.4864  brier=0.2515  cov=0.010  sel_acc=0.5385
+  EFA   n= 1303  acc=0.5349  auc=0.4927  brier=0.2515  cov=0.015  sel_acc=0.6000
+  EEM   n= 1303  acc=0.5180  auc=0.5072  brier=0.2506  cov=0.035  sel_acc=0.5333
+  FXI   n= 1303  acc=0.4858  auc=0.5112  brier=0.2495  cov=0.040  sel_acc=0.5962
+  EWJ   n= 1303  acc=0.5188  auc=0.4979  brier=0.2508  cov=0.005  sel_acc=0.7143
+  EWZ   n= 1303  acc=0.5211  auc=0.5050  brier=0.2508  cov=0.044  sel_acc=0.5263
+  MTUM  n= 1303  acc=0.5434  auc=0.5160  brier=0.2511  cov=0.025  sel_acc=0.7188
+  VLUE  n= 1303  acc=0.5127  auc=0.5042  brier=0.2508  cov=0.018  sel_acc=0.5000
+  QUAL  n= 1303  acc=0.5326  auc=0.4954  brier=0.2516  cov=0.020  sel_acc=0.6923
+  USMV  n= 1303  acc=0.5434  auc=0.5043  brier=0.2518  cov=0.015  sel_acc=0.7368
+  XBI   n= 1303  acc=0.5111  auc=0.5142  brier=0.2504  cov=0.012  sel_acc=0.6250
+  XRT   n= 1303  acc=0.5127  auc=0.5290  brier=0.2494  cov=0.017  sel_acc=0.7727
+  XOP   n= 1303  acc=0.5027  auc=0.5293  brier=0.2497  cov=0.034  sel_acc=0.5227
+
+[5/7] Summary
+  Train AUC (pooled): 0.5217
+  Val   AUC (pooled): 0.5079
+  SPY in-sample AUC: 0.4908
+  Test  AUC mean±std: 0.4991 ± 0.0167
+  Test  Acc mean±std: 0.5162 ± 0.0184
+  Constant accuracy (majority): 0.5316
+
+[6/7] Plotting...
+Saved dual_head_tlstm_v3.png
+Saved dual_head_tlstm_v3_summary.csv
+
+[7/7] Done.
