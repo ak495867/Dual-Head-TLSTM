@@ -70,8 +70,8 @@ BATCH_SIZE= 512
 EPOCHS    = 100
 LR        = 5e-4        # §14.1 η_0
 GAMMA     = 1e-5        # §14.1 decoupled weight decay
-LAMBDA_B  = 1.0         # §9.4
-LAMBDA_C  = 0.1         # §9.4
+LAMBDA_B  = 0.3         # §9.4
+LAMBDA_C  = 0.01         # §9.4
 PATIENCE  = 15          # §14.4
 KAPPA_0   = 0.80        # §12.1 target coverage
 
