@@ -1,5 +1,7 @@
 # Dual-Head TLSTM for Volatility
 
+> Research Question : Does a shared LSTM encoder trained with a downside semivol auxiliary head produce a materially better H day volatility forecast than a 3 parameter HAR-RV regression?
+---
 A shared-encoder, two-head recurrent model for **log realized volatility** and **log downside semivolatility** on a cross-section of assets — with proper scoring and interval calibration.
 
 Every input is $\mathcal{F}_t$-measurable, every split is chronological **by calendar date** and embargoed, and each structural claim in the design carries a proof. See [`MATH.md`](MATH.md).
