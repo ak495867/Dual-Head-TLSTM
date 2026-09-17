@@ -1,6 +1,11 @@
 Device: cpu
 
-Config: T=30, H=5, hidden=64, λ_B=1.0, λ_C=0.2
+Config: T=30, H=5, hidden=64, λ_B=0.1, λ_C=0.0
+FIX 1: Head A target centered on train mean
+FIX 2: Head B target = δ = ℓ^total − ℓ^down, standardized
+FIX 3: λ_B = 0.1 (scale-matched)
+FIX 4: λ_C = 0.0 (consistency term removed)
+FIX 5: δ computed with v_down floor = 0.2·v_total
 
 [1/7] Downloading data...
   SPY: 2956 rows
@@ -47,66 +52,61 @@ Config: T=30, H=5, hidden=64, λ_B=1.0, λ_C=0.2
   Total windows: 110691
 
 [3/7] Calendar-date split (embargo T+H)...
-  Train ends 2019-02-28, val in [2019-04-22, 2021-07-02], test from 2021-08-24
+  Train ends 2019-02-28, val [2019-04-22, 2021-07-02], test from 2021-08-24
   Windows: train=64597, val=21128, test=22306
 
-[4/7] Fitting train-fold scaler...
-  Scaler fit on 64597 windows
+[4/7] Target statistics (train fold):
+  ℓ^total: mean=-4.7235, std=0.6139
+  δ      : mean=0.6384, std=0.5585, min=0.0000, max=1.6094
 
 [5/7] Fitting HAR-RV baseline (Corsi 2009)...
-  HAR coefs: [0.0155625  0.09678435 0.25307545], intercept=-1.3367
-  HAR train R²: 0.3289
+  HAR coefs: [0.0155626  0.09678443 0.25307518], intercept=-1.3367
+  HAR train R²: 0.3289, residual σ: 0.5029
 
-[6/7] Training main Dual-Head TLSTM (vol)...
+[6/7] Training main Dual-Head TLSTM (v3.1)...
   Params: 26,371
-  ep   1 | train=17.5115  val=4.9380 *
-  ep   2 | train=4.1502  val=4.2965 *
-  ep   3 | train=4.1002  val=4.2207 *
-  ep   7 | train=4.0103  val=4.2052 *
-  ep  11 | train=3.9177  val=4.3545
-  ep  21 | train=3.6722  val=4.7898
-  early stop ep 27
-  Time: 2.2 min | best val = 4.2052
+  ep   1 | train=0.3932 (LA=0.2933 LB=0.9993) val=0.3804 *
+  ep   2 | train=0.3589 (LA=0.2592 LB=0.9969) val=0.3791 *
+  ep  11 | train=0.3329 (LA=0.2398 LB=0.9310) val=0.4380
+  ep  21 | train=0.2955 (LA=0.2162 LB=0.7931) val=0.5118
+  early stop ep 22
+  Time: 1.4 min | best val = 0.3791
 
 [7/7] Evaluating on test...
 
-  Training single-head baseline (λ_B=λ_C=0)...
-  ep   1 | train=1.7636  val=0.3397 *
-  ep   2 | train=0.3453  val=0.2940 *
-  ep   3 | train=0.3319  val=0.2842 *
-  ep   6 | train=0.3094  val=0.2810 *
-  ep   7 | train=0.3060  val=0.2785 *
-  ep   8 | train=0.3013  val=0.2768 *
-  ep   9 | train=0.2955  val=0.2749 *
-  ep  11 | train=0.2893  val=0.2737 *
-  ep  13 | train=0.2853  val=0.2726 *
-  ep  14 | train=0.2824  val=0.2705 *
-  ep  16 | train=0.2778  val=0.2694 *
-  ep  21 | train=0.2693  val=0.2883
-  ep  31 | train=0.2547  val=0.3105
-  early stop ep 36
+  Training single-head baseline (λ_B=0)...
+  ep   1 | train=0.2932 (LA=0.2932 LB=1.0046) val=0.2836 *
+  ep   2 | train=0.2591 (LA=0.2591 LB=1.0056) val=0.2816 *
+  ep  11 | train=0.2393 (LA=0.2393 LB=1.0061) val=0.3207
+  ep  21 | train=0.2206 (LA=0.2206 LB=1.0078) val=0.3492
+  early stop ep 22
   Training detached Head B baseline...
-  ep   1 | train=18.8421  val=4.3842 *
-  ep   2 | train=4.1537  val=4.1961 *
-  ep  11 | train=4.0273  val=4.2461
-  ep  21 | train=3.9342  val=4.3414
+  ep   1 | train=0.3931 (LA=0.2932 LB=0.9994) val=0.3802 *
+  ep   2 | train=0.3589 (LA=0.2591 LB=0.9974) val=0.3785 *
+  ep  11 | train=0.3377 (LA=0.2393 LB=0.9835) val=0.4216
+  ep  21 | train=0.3159 (LA=0.2206 LB=0.9528) val=0.4601
   early stop ep 22
 
 ==============================================================================================================
-Model                              CRPS   Pearson    Spear    QLIKE    MSE_ℓ   cov80   cov95
+Model                            CRPS   Pearson    Spear    QLIKE    MSE_ℓ   cov80   cov95
 --------------------------------------------------------------------------------------------------------------
-  Main dual-head                 CRPS=0.2590  ρ=0.6255  ρ_s=0.6334  QLIKE=0.1247  MSE_ℓ=0.2108  cov80=0.889  cov95=0.978
-  HAR-RV (Corsi)                 CRPS=0.2587  ρ=0.6138  ρ_s=0.6192  QLIKE=0.1242  MSE_ℓ=0.2147  cov80=0.848  cov95=0.964
-  Single-head                    CRPS=0.2358  ρ=0.6639  ρ_s=0.6674  QLIKE=0.0966  MSE_ℓ=0.1803  cov80=0.852  cov95=0.961
-  Detached Head B                CRPS=0.2510  ρ=0.6623  ρ_s=0.6754  QLIKE=0.1105  MSE_ℓ=0.1896  cov80=0.929  cov95=0.988
-  Constant                       CRPS=0.3735  ρ=nan  ρ_s=nan  QLIKE=0.3182  MSE_ℓ=0.4408  cov80=0.774  cov95=0.928
+  Main dual-head               CRPS=0.2393  ρ=0.6446  ρ_s=0.6539  QLIKE=0.1031  MSE_ℓ=0.1870  cov80=0.780  cov95=0.926
+  HAR-RV (Corsi)               CRPS=0.2587  ρ=0.6138  ρ_s=0.6191  QLIKE=0.1242  MSE_ℓ=0.2147  cov80=0.848  cov95=0.964
+  Single-head                  CRPS=0.2393  ρ=0.6448  ρ_s=0.6542  QLIKE=0.1033  MSE_ℓ=0.1871  cov80=0.782  cov95=0.927
+  Detached Head B              CRPS=0.2393  ρ=0.6448  ρ_s=0.6542  QLIKE=0.1033  MSE_ℓ=0.1871  cov80=0.782  cov95=0.927
+  Constant                     CRPS=0.3735  ρ=nan  ρ_s=nan  QLIKE=0.3182  MSE_ℓ=0.4408  cov80=0.774  cov95=0.928
 ==============================================================================================================
 
-Abstention diagnostic (τ_σ = q80 val = 0.5722):
-  Coverage: 0.930
-  Confident subset               CRPS=0.2562  ρ=0.6058  ρ_s=0.6056  QLIKE=0.1199  MSE_ℓ=0.2054  cov80=0.891  cov95=0.980
-  Uncertain subset               CRPS=0.2974  ρ=0.5310  ρ_s=0.6783  QLIKE=0.1882  MSE_ℓ=0.2827  cov80=0.867  cov95=0.961
-  → σ̂ correctly identifies easy vs hard windows
+Delta vs Single-head (negative = better):
+  Main dual-head         ΔCRPS=-0.0000  ΔQLIKE=-0.0003
+  HAR-RV                 ΔCRPS=+0.0194  ΔQLIKE=+0.0208
+  Detached Head B        ΔCRPS=+0.0000  ΔQLIKE=+0.0000
 
-Saved: dual_head_tlstm_vol_v3.pth
-Saved: dual_head_tlstm_vol_v3.png
+Abstention diagnostic (τ_σ = q80 val = 0.4476):
+  Coverage: 0.848
+  Confident subset             CRPS=0.2360  ρ=0.6422  ρ_s=0.6387  QLIKE=0.0992  MSE_ℓ=0.1814  cov80=0.770  cov95=0.921
+  Uncertain subset             CRPS=0.2577  ρ=0.6540  ρ_s=0.7157  QLIKE=0.1246  MSE_ℓ=0.2180  cov80=0.837  cov95=0.952
+  ✓ σ̂ separates easy from hard windows
+
+Saved: dual_head_tlstm_vol_v3_1.pth
+Saved: dual_head_tlstm_vol_v3_1.png
