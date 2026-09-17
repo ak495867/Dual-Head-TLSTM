@@ -1,8 +1,23 @@
-# Dual-Head TLSTM
+# Dual-Head TLSTM for Volatility
 
-A shared-encoder, two-head recurrent model for multi-horizon distributional forecasting of log returns on a cross-section of assets — with an auxiliary volatility head and a volatility-thresholded abstention rule.
+A shared-encoder, two-head recurrent model for **log realized volatility** and **log downside semivolatility** on a cross-section of assets — with proper scoring and interval calibration.
 
 Every input is $\mathcal{F}_t$-measurable, every split is chronological **by calendar date** and embargoed, and each structural claim in the design carries a proof. See [`MATH.md`](MATH.md).
+
+---
+
+## What changed and why
+
+The v2.0 run was unambiguous:
+
+| Signal | Evidence | Conclusion |
+|---|---|---|
+| Vol head works | $\rho = 0.6531$ | Promote to primary |
+| Direction head dead | $0.5165 \approx$ constant | Remove entirely |
+| Co-adaptation real | Joint $0.6531$ vs Detached $0.6408$ | Keep dual-head structure |
+| Encoder encodes vol | $\rho = 0.44$ from random Head B | Encoder genuinely learns vol structure |
+
+The pivot is clean, not a consolation prize. Volatility forecasting is where daily-frequency LSTM models consistently beat HAR-RV baselines; the task has genuine signal-to-noise.
 
 ---
 
@@ -16,18 +31,16 @@ X[a,t] ∈ R^(T×12)
                            │              │
                            ▼              ▼
                      Head A  f_A     Head B  f_B
-                  (μ_1..μ_H, logσ)    (log v̂)
+                  (μ_vol, log σ_vol)   (log v̂_down)
+                    Gaussian on         MSE on
+                    log v^total         log v^down
                            │              │
-                    L_A (CRPS)   λ·L_B (vol MSE)
+              L_A (CRPS)  λ_B·L_B (MSE)  λ_C·L_C (offset)
                            │              │
                            └──► L_A + λ_B·L_B + λ_C·L_C ◄──┘
-                                   │
-                          validation-quantile threshold τ_vol
-                                   │
-                          { −1, +1, ⊥ }
 ```
 
-One encoder, two objectives. Gradients from both heads reach $\theta$, so the representation is a compromise between forecasting location and forecasting scale:
+One encoder, two objectives. Gradients from both heads reach $\theta$, so the representation is a compromise between total-vol and downside-vol structure:
 
 $$
 \frac{\partial\mathcal{L}_{\mathrm{total}}}{\partial\theta}
@@ -40,16 +53,21 @@ $$
 
 ## Heads
 
-**Head A** — $H$-day Gaussian forecast: location $\mu_h$ and scale $\log\sigma_h$ per horizon, trained under the closed-form **Gaussian CRPS**, a strictly proper scoring rule. Properness is what makes the calibration claim rigorous rather than post hoc.
+**Head A** — Gaussian on standardized log **total** volatility, trained under the closed-form **Gaussian CRPS**, a strictly proper scoring rule. Properness is what makes the calibration claim rigorous rather than post hoc.
 
-**Head B** — auxiliary scalar $\log \widehat v$, trained in log space by MSE against realized vol $\sqrt{H^{-1}\sum_h r_{t+h}^2}$. Two roles:
+**Head B** — a **different functional of the same return vector**: log **downside** semivolatility. Trained in log space by MSE. A model that predicts both $v^{\mathrm{tot}}$ and $v^{\mathrm{down}}$ has represented the asymmetry of the return distribution *without ever emitting a directional forecast* — which is exactly the residual signal the v2.0 direction head failed to extract.
 
-| Role | Output | Feeds abstention |
-|---|---|---|
-| `vol` (default) | $\widehat v = e^{\widehat \ell}$ | yes — threshold on $\widehat v$ |
-| `ablate` | same, but `sg[ψ]` | no — isolates co-adaptation from mere presence of a second head |
+**Consistency term** — the two targets are linked by the symmetry identity
 
-An optional consistency term $\mathcal{L}_C$ anchors $\log\bar\sigma$ to `sg[log v̂]`, breaking the additive-shift degeneracy of Head B under $\lambda_C = 0$.
+$$
+\mathbb{E}[r^{2}] \approx 2\,\mathbb{E}[\min(r,0)^{2}]
+\;\Longrightarrow\;
+\ell^{\mathrm{tot}} \approx \ell^{\mathrm{down}} + \tfrac{1}{2}\log 2 .
+$$
+
+The offset $c_\star = \tfrac{1}{2}\log 2 / s_\ell$ is **not a hyperparameter** — it is the population anchor under return symmetry. $\mathcal{L}_C$ penalizes deviation of $\mu^{\mathrm{vol}}$ from `sg[ℓ̂_down + c⋆]`; the stop-gradient is what preserves identifiability.
+
+Residual of $\mathcal{L}_C$ is a leverage-asymmetry diagnostic, reportable without retraining.
 
 ---
 
@@ -63,10 +81,10 @@ $r^{(1)}$, $r^{(5)}$, $r^{(20)}$, $\mathrm{vol}_{20}$, $\mathrm{vol}_{60}$, MA5-
 
 ## Causality guarantees
 
-- Rolling statistics and forward-fill are $\mathcal{F}_t$-measurable; interpolation and backward-fill are not (Prop. 2.7).
-- Standardization, vol scale $s_{\mathrm{vol}}$, and the abstention threshold $\tau_{\mathrm{vol}}$ are fitted on the training/validation blocks alone (Lemmas 4.2, 4.5).
-- Train/val/test are **contiguous by calendar date**, separated by an embargo of $T + H$ dates, so no window's label crosses a boundary (Thm. 2.10).
-- Windows are cut per asset, never over a concatenated panel (Prop. 2.13) — this closes the pooled-index leakage channel left open in v1.0.
+- Rolling statistics and forward-fill are $\mathcal{F}_t$-measurable; interpolation and backward-fill are not (Prop. 2.6).
+- Standardization, log-target scaling $(\mu_\ell, s_\ell)$, and the offset $c_\star$ are fitted on the training block alone (Lemmas 4.2, 4.4).
+- Train/val/test are **contiguous by calendar date**, separated by an embargo of $T + H$ dates, so no window's label crosses a boundary (Thm. 2.9).
+- Windows are cut per asset, never over a concatenated panel (Prop. 2.12) — closes the pooled-index leakage channel left open in v1.0.
 - The online replay buffer runs to $s = t - H$, so no label used for an update postdates the forecast (Lemma 13.2).
 
 ---
@@ -84,17 +102,17 @@ cfg = Config(
     window=30,
     horizon=5,
     hidden=64,
-    head_b="vol",          # vol | ablate
-    lam_B=1.0,             # volatility loss weight
-    lam_C=0.0,             # consistency loss weight
-    coverage=0.80,         # target κ_0 for abstention
-    embargo=True,
+    lam_B=1.0,            # downside MSE weight
+    lam_C=0.5,            # offset consistency weight
+    weight_decay=1e-5,    # AdamW decoupled decay γ
 )
 
 model = DualHeadTLSTM(cfg)
 model.fit(panel, split=("2015-01-01", "2021-01-01", "2023-01-01"))
-model.threshold()                 # τ_vol from validation quantile
-out = model.predict(panel_test)   # per-horizon (μ, σ), vol, and {−1, +1, ⊥}
+out = model.predict(panel_test)
+# out.mu_vol, out.sigma_vol     -> per-horizon log total vol, standardized
+# out.ell_down                  -> log downside semivolatility
+# out.interval(alpha=0.20)      -> 80% two-sided Gaussian interval
 ```
 
 ---
@@ -106,30 +124,40 @@ out = model.predict(panel_test)   # per-horizon (μ, σ), vol, and {−1, +1, �
 | `window` | $T$ | sequence length |
 | `horizon` | $H$ | forecast horizon in days |
 | `hidden` | $h$ | encoder width |
-| `lam_B` | $\lambda_B$ | volatility loss weight |
-| `lam_C` | $\lambda_C$ | consistency loss weight |
-| `coverage` | $\kappa_0$ | target coverage of the abstention rule |
+| `lam_B` | $\lambda_B$ | downside MSE weight |
+| `lam_C` | $\lambda_C$ | offset consistency weight |
 | `weight_decay` | $\gamma$ | AdamW decoupled decay |
 | `clip` | $c_\sigma$ | log-$\sigma$ clamp constant |
 
-Notation is deliberately overloaded-free: $\lambda_B, \lambda_C$ are loss weights; $\gamma$ is weight decay; $\mathrm{sigm}$ is the logistic map; $\sigma$ with a subscript is always volatility.
+Notation is overloaded-free: $\lambda_B, \lambda_C$ are loss weights; $\gamma$ is weight decay; $\mathrm{sigm}$ is the logistic map; $\sigma$ with a subscript is always volatility.
 
 ---
 
 ## Evaluation
 
-Reported on the test block only: multi-horizon CRPS, directional accuracy, volatility correlation $\mathrm{corr}(\widehat v, y^{\mathrm{vol}})$, **non-overlapping** annualized Sharpe (Def. 15.2 — v1.0's overlapping-window figure overstates by $\sqrt{H}$), coverage $\kappa$, and selective accuracy.
+Reported on the test block only. Primary metric is **CRPS** — the only metric in the table that is strictly proper for a distributional forecast.
 
-The abstention rule selects a **volatility regime**, not a confidence regime. Coverage is controlled at $\kappa_0$ up to the Kolmogorov distance between the validation and test distributions of $\widehat v$ (Prop. 12.7). Selective accuracy has **no** floor — the bet is that directional accuracy is higher in low-vol regimes, which is a testable hypothesis, not a theorem (Rem. 12.5).
+| Metric | Why it matters |
+|---|---|
+| CRPS | Proper; rewards location and scale jointly |
+| QLIKE | Vol-space Bregman divergence; robust to under-prediction |
+| MSE on log vol | Point-forecast comparison |
+| Pearson $\rho(\exp(\mu^{\mathrm{vol}}), v^{\mathrm{tot}})$ | Original-unit fit |
+| Spearman $\rho_s(\mu^{\mathrm{vol}}, \ell^{\mathrm{tot}})$ | Rank-robust |
+| Coverage 80/95 | Reliability curve, not a single number |
 
-Four baselines are required alongside any result:
+**Interval calibration.** Under a perfectly specified working distribution, $\kappa(\alpha) = 1-\alpha$ (Prop. 12.3). Under misspecification, $\lvert\kappa(\alpha) - (1-\alpha)\rvert \le \varepsilon_{\mathrm{cal}}$, the total-variation distance between the working and true conditional laws (Prop. 12.4). Report coverage as a **reliability curve** $\alpha \mapsto 1-\kappa(\alpha)$ with binomial confidence bands — never a single number in the small-coverage regime.
 
-1. Majority-direction constant.
-2. Single-head ablation ($\lambda_B = \lambda_C = 0$).
-3. Head B with `sg[ψ]` on the encoder — isolates co-adaptation (Thm. 10.2) from the mere presence of a second head.
-4. No-abstention ablation ($\tau_{\mathrm{vol}} = \infty$).
+**Four baselines required** alongside any result:
 
-A claim is reportable only with chronological embargoed splits, train-fold-only preprocessing, a paired binomial or block-bootstrap confidence interval at the realized accepted count, and all four baselines under the same split (Def. 15.6).
+1. **Constant** — training-block mean of $\widetilde{\ell}^{\,\mathrm{tot}}$.
+2. **HAR-RV (Corsi 2009)** — the industry benchmark. *A model that does not beat it on CRPS is not reportable as a volatility forecaster.*
+3. **Single-head ablation** ($\lambda_B = \lambda_C = 0$).
+4. **Detached Head B** (`sg[ψ]` on the encoder path) — separates co-adaptation (Thm. 10.2) from mere presence of a second head.
+
+The v2.0 result — joint $\rho = 0.6531$ vs detached $\rho = 0.6408$ — is the empirical evidence that co-adaptation, not head count, is doing the work.
+
+A claim is reportable only with chronological embargoed splits, train-fold-only preprocessing, a paired binomial or block-bootstrap confidence interval, and all four baselines under the same split (Def. 15.10).
 
 ---
 
