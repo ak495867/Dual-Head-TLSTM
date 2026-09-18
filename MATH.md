@@ -1,8 +1,8 @@
 # Dual-Head TLSTM — Mathematical Specification
 
-**A shared-encoder recurrent engine for log realized volatility, with a formal criterion for auxiliary-head value**
+**A shared-encoder recurrent engine for log realized volatility, with flexible working distributions, encoder-separating auxiliary targets, and structured co-adaptation**
 
-Version 4.0 · Formal revision
+Version 5.0 · Formal revision
 
 ---
 
@@ -10,11 +10,9 @@ Version 4.0 · Formal revision
 
 ### 0.1 Scope
 
-This document specifies, at the level of measure-theoretic probability and differentiable optimization, a shared-encoder recurrent model for **log realized volatility** forecasting on a cross-section of financial assets, and gives a **formal theory of when a second head can add value**. Head A predicts the conditional distribution of log realized volatility over an $H$-day window under a Gaussian working law. Head B predicts an auxiliary target whose selection is governed by §10.
+This document specifies a shared-encoder recurrent model for **log realized volatility** forecasting on a cross-section of financial assets. Head A emits a **conditional distribution** of the log target; the working law is now a design variable ranging from a single Gaussian to a quantile vector. Head B emits an **auxiliary target** chosen so the pair satisfies the encoder-separation criterion of §10. Co-adaptation between the two heads is structured by explicit architectural choices (§6.4–§6.6) and by gradient-surgery rules (§14.5).
 
-Version 3.x established empirically — at four-decimal precision and across four separate configurations — that the target pair $(\ell^{\mathrm{tot}}, \ell^{\mathrm{down}})$ adds no CRPS over single-head. Version 4.0 does three things. It **proves** that this is not a tuning failure but a structural consequence of the target pair satisfying $\psi^\star_A = \psi^\star_B$ (§10.2). It states the **necessary condition** for any auxiliary target to add value (§10.3). And it **classifies** the candidate targets of the tiered research program by whether they satisfy it (§10.4).
-
-The practical consequence: **single-head is the shipped model.** Dual-head is a research program with an explicit stop condition.
+Version 4.0 established the necessary condition for a dual head to add value (Theorem 10.8) and the four-source classification (Theorem 10.12). Version 5.0 does three things. It **generalizes Head A** from a single Gaussian to a family of working laws, indexed by expressiveness and parameter count (§7). It **fixes the auxiliary-target menu** for Head B to three encoder-separating, informative families (§8). It **structures co-adaptation** through per-head pooling, adapters, FiLM, and PCGrad, with formal conditions on when each is a no-op (§6, §11, §14).
 
 ### 0.2 Conventions
 
@@ -24,21 +22,21 @@ The practical consequence: **single-head is the shipped model.** Dual-head is a 
 | Numbering | `X.Y` where `X` is the section |
 | Vectors | column vectors; $\top$ transpose |
 | Logistic map | $\mathrm{sigm}(z) = (1+e^{-z})^{-1}$ |
-| Volatility | $v, \sigma$ are positive volatilities; the logistic map is never written $\sigma$ |
+| Softplus | $\varsigma(u) = \log(1+e^{u})$ |
+| Volatility | $v, \sigma$ positive volatilities; the logistic map is never written $\sigma$ |
 | Positive, negative parts | $(u)_{+} = \max(u,0)$, $(u)_{-} = \max(-u,0)$ |
 | Stop-gradient | $\mathrm{sg}[\cdot]$: value identity, zero Jacobian |
 | Indicator | $\mathbf{1}\{\cdot\}$ |
-| Gaussian density, CDF | $\phi$, $\Phi$ |
-| KL divergence | $D_{\mathrm{KL}}(\cdot\|\cdot)$ |
-| Mutual information | $I(\cdot;\cdot)$, $I(\cdot;\cdot\mid\cdot)$ |
-| Numerical floor | $\epsilon > 0$ fixed throughout |
-| Encoder family | $\Psi = \{\psi_\theta : \theta\in\Theta\}$ |
-| Single-task optimum | $\theta^\star_Z$, $\psi^\star_Z$ (Definition 10.1) |
-| Shared-task optimum | $\theta^\star_{AB}$ (Definition 10.2) |
+| CDF, quantile function | $F$, $F^{-1}$ |
+| Pinball loss | $\rho_\tau(u) = u(\tau - \mathbf{1}\{u<0\})$ |
+| Numerical floor | $\epsilon>0$ fixed throughout |
+| Encoder family | $\Psi = \{\psi_\theta\}_{\theta\in\Theta}$ |
+| Single-task optimum | $\theta^\star_Z$, $\psi^\star_Z$ (Def. 10.1) |
+| Shared-task optimum | $\theta^\star_{AB}$ (Def. 10.2) |
 
 ### 0.3 Rendering note
 
-All mathematics uses GitHub-flavoured LaTeX delimiters: `$…$` inline and `$$…$$` display. No custom macros, no `\tag`, no `\label`, no pipe characters inside table-cell math.
+GitHub-flavoured LaTeX delimiters: `$…$` inline, `$$…$$` display. No custom macros, no `\tag`, no `\label`, no pipes inside table-cell math.
 
 ---
 
@@ -46,74 +44,55 @@ All mathematics uses GitHub-flavoured LaTeX delimiters: `$…$` inline and `$$�
 
 ### 1.1 The filtered probability space
 
-Let $(\Omega,\mathcal{F},\mathbb{P})$ carry a discrete-time filtration $\{\mathcal{F}_t\}_{t\in\mathbb{Z}}$ with
-
-$$
-\mathcal{F}_s \subseteq \mathcal{F}_t \subseteq \mathcal{F}
-\qquad \text{for all } s \le t .
-$$
-
-$\mathcal{F}_t$ is the $\sigma$-algebra generated by all information observable at or before the close of trading day $t$: prices, volumes, and macro series released up to and including that close.
+Let $(\Omega,\mathcal{F},\mathbb{P})$ carry a discrete-time filtration $\{\mathcal{F}_t\}_{t\in\mathbb{Z}}$ with $\mathcal{F}_s\subseteq\mathcal{F}_t\subseteq\mathcal{F}$ for $s\le t$. $\mathcal{F}_t$ is generated by information observable at or before the close of day $t$.
 
 ### 1.2 Observables
 
-Let $\mathcal{A}$ be the finite asset universe, $\lvert\mathcal{A}\rvert = N$. For $a\in\mathcal{A}$, $t\in\mathbb{Z}$: close $C_{a,t} > 0$, open $O_{a,t} > 0$, high $H_{a,t}$, low $L_{a,t}$, volume $V_{a,t}\ge 0$.
+Let $\mathcal{A}$ be the finite asset universe, $\lvert\mathcal{A}\rvert=N$. For $a\in\mathcal{A}$, $t\in\mathbb{Z}$: close $C_{a,t}$, open $O_{a,t}$, high $H_{a,t}$, low $L_{a,t}$, volume $V_{a,t}$.
 
-**Assumption A1.** All raw series are $\mathcal{F}_t$-measurable for every $a$ and every $t$.
+**Assumption A1.** All raw series are $\mathcal{F}_t$-measurable.
 
 ### 1.3 Targets
 
 **Definition 1.1 (log return).** $r_{a,t} = \log C_{a,t} - \log C_{a,t-1}$.
 
-**Definition 1.2 (realized variance and volatility).**
+**Definition 1.2 (realized volatility).**
 
 $$
 \mathrm{RV}^{(H)}_{a,t} = \sum_{h=1}^{H} r_{a,t+h}^{2},
 \qquad
-v^{(H)}_{a,t} = \sqrt{\mathrm{RV}^{(H)}_{a,t} / H}.
+v^{(H)}_{a,t} = \sqrt{\mathrm{RV}^{(H)}_{a,t}/H},
+\qquad
+\ell^{(H)}_{a,t} = \log\!\big(v^{(H)}_{a,t}+\epsilon\big).
 $$
 
-**Definition 1.3 (log realized volatility).**
-
-$$
-\ell^{(H)}_{a,t} = \log\!\big(v^{(H)}_{a,t} + \epsilon\big).
-$$
-
-**Definition 1.4 (downside realized semivariance).**
+**Definition 1.3 (downside realized semivariance).**
 
 $$
 \mathrm{RV}^{\mathrm{down},(H)}_{a,t} = \sum_{h=1}^{H} (r_{a,t+h})_{-}^{2},
 \qquad
-\ell^{\mathrm{down},(H)}_{a,t} = \log\!\Big(\sqrt{\mathrm{RV}^{\mathrm{down},(H)}_{a,t}/H} + \epsilon\Big).
+\ell^{\mathrm{down},(H)}_{a,t} = \log\!\Big(\sqrt{\mathrm{RV}^{\mathrm{down},(H)}_{a,t}/H}+\epsilon\Big).
 $$
 
-**Definition 1.5 (bipower variation, Barndorff-Nielsen & Shephard 2004).** With $\mu_1 = \mathbb{E}\lvert Z\rvert$ for $Z\sim\mathcal{N}(0,1)$,
+**Definition 1.4 (bipower variation, Barndorff-Nielsen & Shephard 2004).** With $\mu_1 = \mathbb{E}\lvert Z\rvert$ for $Z\sim\mathcal{N}(0,1)$,
 
 $$
-\mathrm{BPV}^{(H)}_{a,t} = \frac{1}{\mu_1^{2}}\sum_{h=2}^{H}\lvert r_{a,t+h}\rvert\,\lvert r_{a,t+h-1}\rvert,
+\mathrm{BPV}^{(H)}_{a,t} = \frac{1}{\mu_1^{2}}\sum_{h=2}^{H}\lvert r_{a,t+h}\rvert\lvert r_{a,t+h-1}\rvert,
 \qquad
-\ell^{\mathrm{bpv},(H)}_{a,t} = \log\!\Big(\sqrt{\mathrm{BPV}^{(H)}_{a,t}/(H-1)} + \epsilon\Big).
+\ell^{\mathrm{bpv},(H)}_{a,t} = \log\!\Big(\sqrt{\mathrm{BPV}^{(H)}_{a,t}/(H-1)}+\epsilon\Big).
 $$
 
-**Definition 1.6 (jump variation).** $\mathrm{JV}^{(H)}_{a,t} = \max\big(\mathrm{RV}^{(H)}_{a,t} - \mathrm{BPV}^{(H)}_{a,t},\,0\big)$.
+**Definition 1.5 (jump variation).** $\mathrm{JV}^{(H)}_{a,t} = \max(\mathrm{RV}^{(H)}_{a,t}-\mathrm{BPV}^{(H)}_{a,t},0)$.
 
-**Definition 1.7 (cross-sectional rank).** For a fixed date $d$ and the cross-section $\mathcal{A}_d = \{a : \mathrm{date}(a,t) = d\}$,
-
-$$
-\rho_{a,t} = \frac{\mathrm{rank}_{\mathcal{A}_d}\big(\ell^{\mathrm{tot}}_{a,t}\big) - \tfrac12}{\lvert\mathcal{A}_d\rvert}
-\;\in\;(0,1).
-$$
-
-**Remark 1.8 (the fundamental constraint).** Every target above is $\mathcal{F}_{t+H}$-measurable and not, in general, $\mathcal{F}_t$-measurable. The causality apparatus of §2 constrains every object used to forecast any target to be $\mathcal{F}_t$-measurable.
-
-**Remark 1.9 (which targets are pairwise deterministic functions).** Under return symmetry,
+**Definition 1.6 (cross-sectional rank).** For date $d$ and $\mathcal{A}_d = \{a:\mathrm{date}(a,t)=d\}$,
 
 $$
-\ell^{\mathrm{tot}} \approx \ell^{\mathrm{down}} + \tfrac12\log 2
-\qquad\text{(off by a constant).}
+\rho_{a,t} = \frac{\mathrm{rank}_{\mathcal{A}_d}(\ell^{\mathrm{tot}}_{a,t})-\tfrac12}{\lvert\mathcal{A}_d\rvert}\in(0,1).
 $$
 
-This is the structural coupling that makes the v3.x pair $(\ell^{\mathrm{tot}}, \ell^{\mathrm{down}})$ fail the criterion of §10. The pairs $(\ell^{(H)}, \ell^{(H')})$ for $H \neq H'$, $(\ell^{\mathrm{tot}}, \ell^{\mathrm{bpv}})$, and $(\ell^{\mathrm{tot}}, \rho)$ are pairwise non-functional of each other in population.
+**Remark 1.7 (the fundamental constraint).** Every target is $\mathcal{F}_{t+H}$-measurable; §2 constrains every forecasting input to $\mathcal{F}_t$-measurability.
+
+**Remark 1.8 (structural couplings).** Under return symmetry, $\ell^{\mathrm{tot}} \approx \ell^{\mathrm{down}} + \tfrac12\log 2$ — a deterministic relationship (Theorem 10.4 then kills the dual-head gradient). The pairs $(\ell^{(H)},\ell^{(H')})$ for $H\neq H'$, $(\ell^{\mathrm{tot}},\ell^{\mathrm{bpv}})$, and $(\ell^{\mathrm{tot}},\rho)$ are pairwise non-functional in population, and are therefore admissible auxiliary targets (§8).
 
 ### 1.4 Standing assumptions
 
@@ -121,14 +100,14 @@ This is the structural coupling that makes the v3.x pair $(\ell^{\mathrm{tot}}, 
 |---|---|
 | **A1** | Raw series $\mathcal{F}_t$-adapted (§1.2). |
 | **A2** | Features are Borel functions of finitely many lagged adapted quantities. |
-| **A3** | Macro series have non-negative release delay and are forward-filled only (§3.5). |
-| **A4** | Splits are chronological **by calendar date** and embargoed (§2.4). |
+| **A3** | Macro series have non-negative release delay and are forward-filled only. |
+| **A4** | Splits are chronological by calendar date and embargoed (§2.4). |
 | **A5** | All fitted preprocessing constants estimated on the training block alone. |
-| **A6** | Losses are a.s. differentiable in parameters at iterates visited by the optimizer. |
-| **A7** | The encoder family $\Psi$ is parametric with $\Theta\subseteq\mathbb{R}^{p}$ compact and the joint objective is trained to approximate a stationary point. |
-| **A8** | The expected loss $\mathbb{E}[\mathcal{L}_Z(\psi_\theta(X),g)]$ is continuous in $(\theta,g)$ and the minimization problem of Definition 10.1 admits a minimizer. |
+| **A6** | Losses are a.s. differentiable in parameters at iterates visited by the optimizer; where the quantile parameterization uses sorting, the sort is a.e. differentiable with unit Jacobian. |
+| **A7** | $\Psi$ is a parametric family with $\Theta\subseteq\mathbb{R}^p$ compact and the joint objective is trained to approximate a stationary point. |
+| **A8** | Population risk $\mathcal{R}_Z(\theta)$ is continuous in $(\theta,g)$ and admits a minimizer. |
 
-**A1–A5** are causality assumptions; **A6–A8** are optimization assumptions. §10 additionally requires **A7–A8** but not **A6**.
+**A1–A5** are causality assumptions. **A6–A8** are optimization assumptions.
 
 ---
 
@@ -138,29 +117,29 @@ This is the structural coupling that makes the v3.x pair $(\ell^{\mathrm{tot}}, 
 
 **Definition 2.1 (causal map).** $\varphi_t$ is **causal** if $\mathcal{F}_t$-measurable for every $t$.
 
-**Definition 2.2 (non-anticipative predictor).** A predictor $\widehat Z_t$ of an $\mathcal{F}_{t+h}$-measurable $Z_t$, $h\ge 1$, is **non-anticipative** if $\mathcal{F}_t$-measurable.
+**Definition 2.2 (non-anticipative predictor).** $\widehat Z_t$ forecasting an $\mathcal{F}_{t+h}$-measurable $Z_t$, $h\ge 1$, is **non-anticipative** if $\mathcal{F}_t$-measurable.
 
-**Definition 2.3 (look-ahead leakage).** A system exhibits leakage at $t$ if some quantity used to form a forecast of an $\mathcal{F}_{t+h}$-measurable target ($h\ge 1$) fails to be $\mathcal{F}_t$-measurable.
+**Definition 2.3 (look-ahead leakage).** A system exhibits leakage at $t$ if a quantity used to forecast an $\mathcal{F}_{t+h}$-measurable target ($h\ge 1$) fails to be $\mathcal{F}_t$-measurable.
 
 ### 2.2 Closure under composition
 
-**Lemma 2.4 (composition preserves causality).** Let $\varphi^{(1)},\dots,\varphi^{(n)}$ be $\mathcal{F}_t$-measurable random elements, and $g$ Borel. Then $g(\varphi^{(1)},\dots,\varphi^{(n)})$ is $\mathcal{F}_t$-measurable.
+**Lemma 2.4.** If $\varphi^{(1)},\dots,\varphi^{(n)}$ are $\mathcal{F}_t$-measurable and $g$ is Borel, then $g(\varphi^{(1)},\dots,\varphi^{(n)})$ is $\mathcal{F}_t$-measurable.
 
-*Proof.* The vector map $\omega\mapsto(\varphi^{(1)}(\omega),\dots,\varphi^{(n)}(\omega))$ is measurable into the product Borel $\sigma$-algebra, which coincides with the Borel $\sigma$-algebra of the product for separable metric spaces. Composition with a Borel map is measurable. ∎
+*Proof.* Vector map measurable into product Borel $\sigma$-algebra, which coincides with Borel of the product for separable metric spaces; composition with Borel map is measurable. ∎
 
-**Corollary 2.5 (rolling statistics are causal).** For Borel $g$ and adapted $(x_s)$, the statistic $g(x_{t-k+1},\dots,x_t)$ is $\mathcal{F}_t$-measurable.
+**Corollary 2.5.** For Borel $g$ and adapted $(x_s)$, $g(x_{t-k+1},\dots,x_t)$ is $\mathcal{F}_t$-measurable.
 
 *Proof.* Lemma 2.4 with $\varphi^{(i)} = x_{t-i+1}\in\mathcal{F}_{t-i+1}\subseteq\mathcal{F}_t$. ∎
 
 ### 2.3 Missing data
 
-**Proposition 2.6 (forward-fill is causal; interpolation is not).** Let $(M_\tau)_{\tau\in\mathcal{S}}$ be adapted on a sparse index set and let $\widetilde M_t = M_{\tau(t)}$ with $\tau(t) = \max\{\tau\in\mathcal{S}:\tau\le t\}$. Then $(\widetilde M_t)$ is causal. Backward-fill and any interpolation between a past and a future observation are not.
+**Proposition 2.6 (forward-fill is causal; interpolation is not).** Let $(M_\tau)_{\tau\in\mathcal{S}}$ be adapted on a sparse index set and $\widetilde M_t = M_{\tau(t)}$ with $\tau(t) = \max\{\tau\in\mathcal{S}:\tau\le t\}$. Then $(\widetilde M_t)$ is causal. Backward-fill and any interpolation between a past and future observation are not.
 
-*Proof.* For Borel $B$, $\{\widetilde M_t\in B\} = \bigcup_{\tau\in\mathcal{S},\,\tau\le t}(\{\tau(t)=\tau\}\cap\{M_\tau\in B\})\in\mathcal{F}_t$. For backward-fill, $\tau^{+}(t) > t$ on a set of positive probability, and $M_{\tau^{+}(t)}$ need not be $\mathcal{F}_t$-measurable. ∎
+*Proof.* For Borel $B$, $\{\widetilde M_t\in B\} = \bigcup_{\tau\in\mathcal{S},\,\tau\le t}(\{\tau(t)=\tau\}\cap\{M_\tau\in B\})\in\mathcal{F}_t$. Backward-fill has $\tau^{+}(t)>t$ on a positive-probability set, and $M_{\tau^{+}(t)}$ need not be $\mathcal{F}_t$-measurable. ∎
 
 ### 2.4 Calendar-date splitting
 
-**Definition 2.7 (calendar-date split).** Let $\mathcal{D}$ be the set of calendar dates in the panel, $m = \lvert\mathcal{D}\rvert$. For $0 < q_1 < q_2 < 1$, $t_1 = \lceil q_1 m\rceil$, $t_2 = \lceil q_2 m\rceil$:
+**Definition 2.7 (calendar-date split).** Let $\mathcal{D}$ be the panel dates, $m = \lvert\mathcal{D}\rvert$. For $0<q_1<q_2<1$, $t_1 = \lceil q_1 m\rceil$, $t_2 = \lceil q_2 m\rceil$:
 
 $$
 \mathcal{T}_{\mathrm{tr}} = \{d_{(1)},\dots,d_{(t_1)}\},\quad
@@ -171,26 +150,26 @@ $$
 **Definition 2.8 (embargo).** For window length $T$ and horizon $H$:
 
 $$
-\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{tr}} = \{d_{(1)},\dots,d_{(t_1 - T - H)}\},
+\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{tr}} = \{d_{(1)},\dots,d_{(t_1-T-H)}\},
 \qquad
-\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{va}} = \{d_{(t_1+1)},\dots,d_{(t_2 - T - H)}\}.
+\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{va}} = \{d_{(t_1+1)},\dots,d_{(t_2-T-H)}\}.
 $$
 
-**Theorem 2.9 (no-leakage under calendar-date splitting).** Under A1–A5 and Definition 2.8, every parameter $\theta$ estimated from $\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{tr}}$ is $\mathcal{F}_{d_{(t_1)}}$-measurable; every calibration quantity from $\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{va}}$ is $\mathcal{F}_{d_{(t_2)}}$-measurable; and every test-block forecast of a target at date $t+h$, $h\ge 1$, is $\mathcal{F}_t$-measurable.
+**Theorem 2.9 (no-leakage).** Under A1–A5 and Definition 2.8, every parameter estimated from $\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{tr}}$ is $\mathcal{F}_{d_{(t_1)}}$-measurable; every calibration quantity from $\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{va}}$ is $\mathcal{F}_{d_{(t_2)}}$-measurable; and every test-block forecast of a target at date $t+h$, $h\ge 1$, is $\mathcal{F}_t$-measurable.
 
-*Proof.* Estimation is a Borel function of finitely many $\mathcal{F}_{d_{(t_1)}}$-measurable quantities; Lemma 2.4. Same argument for the validation block. Compose with $\theta,\tau$ measurable w.r.t. $\mathcal{F}_{d_{(t_1)}},\mathcal{F}_{d_{(t_2)}}\subseteq\mathcal{F}_t$ for $t>d_{(t_2)}$. ∎
+*Proof.* Estimation is Borel in finitely many $\mathcal{F}_{d_{(t_1)}}$-measurable quantities (Lemma 2.4); same for validation; compose with $\theta,\tau$ measurable w.r.t. $\mathcal{F}_{d_{(t_1)}},\mathcal{F}_{d_{(t_2)}}\subseteq\mathcal{F}_t$. ∎
 
-**Remark 2.10 (why the embargo matters).** Without it, a window $X_{a,s}$ with $s\le d_{(t_1)}$ but $s+H > d_{(t_1)}$ contributes a gradient depending on the first validation label. The leak is small in volume but genuine.
+**Remark 2.10 (why the embargo matters).** Without it, a window $X_{a,s}$ with $s\le d_{(t_1)}$ but $s+H>d_{(t_1)}$ contributes a gradient depending on the first validation label.
 
-**Remark 2.11 (contrast with pooled-index splitting).** Splitting the concatenated window tensor by row index is not a chronological split and does not satisfy Theorem 2.9.
+**Remark 2.11 (pooled-index splitting fails).** Splitting the concatenated window tensor by row index does not satisfy Theorem 2.9.
 
 ### 2.5 Per-asset windows
 
-**Proposition 2.12.** If windows are cut over a vertically concatenated per-asset panel, straddling windows are invalid: either their label misrepresents the conditional law the model claims to estimate, or — under a block ordering placing one asset's later dates before another's earlier dates — they leak across calendar dates.
+**Proposition 2.12.** Windows cut over a vertically concatenated per-asset panel are invalid when they straddle asset blocks: the label misrepresents the estimand, or — under a block ordering placing one asset's later dates before another's — the window leaks across calendar dates.
 
 *Proof.* See v2.0 Prop. 2.13; argument identical. ∎
 
-**Specification 2.13.** $X_{a,t} = [\widetilde{\mathbf{x}}_{a,t-T+1},\dots,\widetilde{\mathbf{x}}_{a,t}]^{\top}\in\mathbb{R}^{T\times d}$, pooled into minibatches together with the calendar date $\mathrm{date}(a,t)$.
+**Specification 2.13.** $X_{a,t} = [\widetilde{\mathbf{x}}_{a,t-T+1},\dots,\widetilde{\mathbf{x}}_{a,t}]^{\top}\in\mathbb{R}^{T\times d}$, pooled into minibatches with $\mathrm{date}(a,t)$.
 
 ---
 
@@ -202,42 +181,28 @@ Fix asset $a$; index suppressed.
 
 **Definition 3.2 (realized volatility).** $\mathrm{vol}_{k,t} = \sqrt{\frac{1}{k-1}\sum_{j=0}^{k-1}(r^{(1)}_{t-j}-\bar r^{(k)}_t)^2}$, $k\in\{20,60\}$.
 
-**Definition 3.3 (MA ratio).** $\mathrm{MA}_k\mathrm{Ratio}_t = C_t/(\tfrac{1}{k}\sum_{j=0}^{k-1} C_{t-j}) - 1$, $k\in\{5,20\}$.
+**Definition 3.3 (MA ratio).** $\mathrm{MA}_k\mathrm{Ratio}_t = C_t/(\tfrac1k\sum_{j=0}^{k-1}C_{t-j})-1$, $k\in\{5,20\}$.
 
-**Definition 3.4 (Wilder RSI).** With $U_t = (C_t-C_{t-1})_{+}$, $D_t = (C_{t-1}-C_t)_{+}$ and Wilder recursion, $\mathrm{RSI}_t = 100(1 - 1/(1+\bar U_t/(\bar D_t+\epsilon)))$.
+**Definition 3.4 (Wilder RSI).** With $U_t = (C_t-C_{t-1})_{+}$, $D_t = (C_{t-1}-C_t)_{+}$, Wilder recursion, $\mathrm{RSI}_t = 100(1-1/(1+\bar U_t/(\bar D_t+\epsilon)))$.
 
-**Definition 3.5 (relative volume).** $\Delta V^{\%}_t = V_t/(\mathrm{MA}_{20}(V)_t+\epsilon) - 1$.
+**Definition 3.5 (relative volume).** $\Delta V^{\%}_t = V_t/(\mathrm{MA}_{20}(V)_t+\epsilon)-1$.
 
-**Definition 3.6 (macro features).** With forward-filled VIX and TNX:
+**Definition 3.6 (macro features).** $\Delta\mathrm{VIX}^{\%}_t = \mathrm{VIX}_t/\mathrm{VIX}_{t-1}-1$, similarly TNX.
 
-$$
-\Delta\mathrm{VIX}^{\%}_t = \mathrm{VIX}_t/\mathrm{VIX}_{t-1}-1,
-\qquad
-\Delta\mathrm{TNX}^{\%}_t = \mathrm{TNX}_t/\mathrm{TNX}_{t-1}-1.
-$$
+**Definition 3.7 (extended candidates).**
 
-**Definition 3.7 (v4.0 candidate feature extensions).**
-
-- Overnight gap: $g_t = \log(O_t / C_{t-1})$.
+- Overnight gap: $g_t = \log(O_t/C_{t-1})$.
 - Intraday range: $\mathrm{range}_t = \log(H_t/L_t)$.
-- Volume imbalance: $\mathrm{imb}_t = (V_t - \mathrm{median}_{20}(V)_t)/(\mathrm{MAD}_{20}(V)_t+\epsilon)$.
-- Term spread: $\mathrm{term}_t = \mathrm{VIX}_t - \mathrm{VIX3M}_t$, if VIX3M is available.
+- Volume imbalance: $\mathrm{imb}_t = (V_t-\mathrm{median}_{20}(V)_t)/(\mathrm{MAD}_{20}(V)_t+\epsilon)$.
+- Term spread: $\mathrm{term}_t = \mathrm{VIX}_t-\mathrm{VIX3M}_t$.
 
-**Definition 3.8 (feature vector).** The reference vector is
+**Definition 3.8 (feature vector).** Reference $\mathbf{x}_t\in\mathbb{R}^{12}$; extended $\mathbf{x}_t\in\mathbb{R}^{16}$.
 
-$$
-\mathbf{x}_t = [r^{(1)}, r^{(5)}, r^{(20)}, \mathrm{vol}_{20}, \mathrm{vol}_{60}, \mathrm{MA}_5\mathrm{Ratio}, \mathrm{MA}_{20}\mathrm{Ratio}, \mathrm{RSI}, \Delta V^{\%}, \mathrm{VIX}, \Delta\mathrm{VIX}^{\%}, \Delta\mathrm{TNX}^{\%}]^{\top}\in\mathbb{R}^{12}.
-$$
+**Proposition 3.9 (causality).** Under A1–A3, $\mathbf{x}_t$ is $\mathcal{F}_t$-measurable.
 
-The extended vector appends $(g,\mathrm{range},\mathrm{imb},\mathrm{term})$, giving $d = 16$.
+*Proof.* Each coordinate is Borel in $\{C_s,V_s,O_s,H_s,L_s\}_{s\le t}$; Wilder recursion is Borel by induction; macro coordinates are causal by Proposition 2.6. Lemma 2.4. ∎
 
-**Proposition 3.9 (the feature map is causal).** Under A1–A3, $\mathbf{x}_t$ is $\mathcal{F}_t$-measurable.
-
-*Proof.* Each coordinate is a Borel function of $\{C_s,V_s,O_s,H_s,L_s\}_{s\le t}$; the Wilder recursion is Borel by induction; macro coordinates are causal by Proposition 2.6. Lemma 2.4 closes coordinatewise. ∎
-
-### 3.5 Release-delay caveat
-
-**Remark 3.10.** If a macro series carries a publication lag $\delta\ge 1$ days, A3 requires $\tau(t) = \max\{\tau\in\mathcal{S}:\tau+\delta\le t\}$. Forward-fill alone does not rule out the reference-date-as-release-date leak.
+**Remark 3.10 (release delay).** If a macro series has publication lag $\delta\ge 1$, use $\tau(t) = \max\{\tau\in\mathcal{S}:\tau+\delta\le t\}$.
 
 ---
 
@@ -245,15 +210,13 @@ The extended vector appends $(g,\mathrm{range},\mathrm{imb},\mathrm{term})$, giv
 
 ### 4.1 Feature standardization
 
-**Definition 4.1.** For coordinate $j\in\{1,\dots,d\}$ and the training index set $\mathcal{I}_{\mathrm{tr}} = \{(a,t):\mathrm{date}(a,t)\in\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{tr}}\}$,
+**Definition 4.1.** For coordinate $j$ and $\mathcal{I}_{\mathrm{tr}} = \{(a,t):\mathrm{date}(a,t)\in\mathcal{T}^{\,\mathrm{emb}}_{\mathrm{tr}}\}$,
 
 $$
-\mu_j = \frac{1}{\lvert\mathcal{I}_{\mathrm{tr}}\rvert}\sum_{(a,t)\in\mathcal{I}_{\mathrm{tr}}} x_{a,t,j},
+\mu_j = \frac{1}{\lvert\mathcal{I}_{\mathrm{tr}}\rvert}\sum_{\mathcal{I}_{\mathrm{tr}}} x_{a,t,j},
 \qquad
-s_j^2 = \frac{1}{\lvert\mathcal{I}_{\mathrm{tr}}\rvert-1}\sum_{(a,t)\in\mathcal{I}_{\mathrm{tr}}} (x_{a,t,j}-\mu_j)^2,
-$$
-
-$$
+s_j^2 = \frac{1}{\lvert\mathcal{I}_{\mathrm{tr}}\rvert-1}\sum_{\mathcal{I}_{\mathrm{tr}}} (x_{a,t,j}-\mu_j)^2,
+\qquad
 \widetilde x_{a,t,j} = \frac{x_{a,t,j}-\mu_j}{s_j+\epsilon}.
 $$
 
@@ -263,33 +226,31 @@ $$
 
 ### 4.2 Target standardization
 
-**Definition 4.3.** Let
+**Definition 4.3.** With $\mu_\ell, s_\ell$ the training-block mean and std of $\ell^{\mathrm{tot}}$:
 
 $$
-\mu_\ell = \frac{1}{\lvert\mathcal{I}_{\mathrm{tr}}\rvert}\sum_{(a,t)\in\mathcal{I}_{\mathrm{tr}}} \ell^{\mathrm{tot}}_{a,t},
-\qquad
-s_\ell^2 = \frac{1}{\lvert\mathcal{I}_{\mathrm{tr}}\rvert-1}\sum_{(a,t)\in\mathcal{I}_{\mathrm{tr}}} \big(\ell^{\mathrm{tot}}_{a,t}-\mu_\ell\big)^2,
+\widetilde\ell = (\ell-\mu_\ell)/(s_\ell+\epsilon).
 $$
 
-and $\widetilde\ell = (\ell-\mu_\ell)/(s_\ell+\epsilon)$.
-
-**Lemma 4.4.** $(\mu_\ell,s_\ell)$ is $\mathcal{F}_{d_{(t_1)}}$-measurable. Standardization is an invertible positive affine map.
+**Lemma 4.4.** $(\mu_\ell,s_\ell)$ is $\mathcal{F}_{d_{(t_1)}}$-measurable; standardization is invertible and positive affine.
 
 *Proof.* Lemma 2.4. ∎
 
-**Remark 4.5.** Using one $(\mu_\ell,s_\ell)$ for both heads preserves the symmetry identity of Remark 1.9 in standardized units. Any consistency offset $c_\star$ is expressed as $c_\star = \tfrac12\log 2/(s_\ell+\epsilon)$.
+**Remark 4.5.** Using one $(\mu_\ell,s_\ell)$ for both heads preserves the symmetry identity of Remark 1.8 in standardized units; any consistency offset becomes $c_\star = \tfrac12\log 2/(s_\ell+\epsilon)$.
 
 ---
 
 ## 5. Windowing and batch algebra
 
-**Definition 5.1.** $X_{a,t}\in\mathbb{R}^{T\times d}$ as in Specification 2.13.
+**Definition 5.1.** $X_{a,t}\in\mathbb{R}^{T\times d}$ (Specification 2.13).
 
-**Definition 5.2 (minibatch).** $\mathcal{B}\subset\mathcal{A}\times\mathbb{Z}$, $\lvert\mathcal{B}\rvert = B$, giving $\mathcal{X}\in\mathbb{R}^{B\times T\times d}$.
+**Definition 5.2 (minibatch).** $\mathcal{B}\subset\mathcal{A}\times\mathbb{Z}$, $\lvert\mathcal{B}\rvert=B$, giving $\mathcal{X}\in\mathbb{R}^{B\times T\times d}$.
 
-**Constraint 5.3 (no batch-axis mixing).** The encoder $F$ satisfies $F(\mathcal{X})_b = F_1(\mathcal{X}_b)$ for a single-sample map $F_1$.
+**Constraint 5.3 (no batch-axis mixing in the encoder).** $F(\mathcal{X})_b = F_1(\mathcal{X}_b)$ for a single-sample map $F_1$.
 
-**Remark 5.4 (exception for cross-sectional targets).** Constraint 5.3 applies to the *encoder* and to Head A. If Head B's target is defined *by* the batch — e.g. the cross-sectional rank $\rho_{a,t}$ of Definition 1.7 — then the batch axis is a *defined input* to Head B's loss. The batch sampler must group windows by calendar date so this consultation is meaningful. The encoder remains per-sample; only the loss consults the batch.
+**Definition 5.4 (same-date batch sampler).** A batch sampler is **same-date** if every minibatch $\mathcal{B}$ contains only windows $\{(a,t):\mathrm{date}(a,t)=d\}$ for a single $d$, and $\lvert\{a:(a,t)\in\mathcal{B}\}\rvert\ge B_{\min}$ for a minimum cross-section width $B_{\min}$.
+
+**Remark 5.5 (exception for cross-sectional targets).** Constraint 5.3 applies to the encoder and Head A. If Head B's target is defined by the batch — the cross-sectional rank of Definition 1.6 — the batch is a *defined input* to Head B's loss, and the sampler must be same-date (Definition 5.4). The encoder remains per-sample.
 
 ---
 
@@ -310,281 +271,424 @@ h_i &= o_i \odot \tanh(c_i).
 \end{aligned}
 $$
 
-Write $\theta$ for the collection of all encoder parameters.
+Write $\theta$ for the encoder parameters. The output tensor is $H_{\mathrm{seq}} = (h_1,\dots,h_T)\in\mathbb{R}^{T\times h}$.
 
-### 6.2 Pooling
+### 6.2 Pooling options
 
-**Definition 6.2 (last-hidden pooling).** $\psi_\theta(X_{a,t}) = h_T$.
+**Definition 6.2 (last-hidden).** $\psi_\theta(X) = h_T$.
 
-**Definition 6.3 (attention pooling).** With query $q\in\mathbb{R}^{h}$,
+**Definition 6.3 (attention pool).** With query $q\in\mathbb{R}^{h}$,
 
 $$
-\alpha_i = \frac{\exp(q^{\top} h_i)}{\sum_{j=1}^{T}\exp(q^{\top} h_j)},
+\alpha_i = \mathrm{softmax}_i(q^{\top} h_i),
 \qquad
-\psi_\theta(X_{a,t}) = \sum_{i=1}^{T}\alpha_i h_i.
+\psi_\theta(X) = \sum_{i=1}^{T}\alpha_i h_i .
 $$
 
-**Definition 6.4 (per-head attention pooling).** Two queries $q_A,q_B$, giving
+**Definition 6.4 (per-head attention pool).** Two queries $q_A,q_B$:
 
 $$
-\psi^A_\theta(X_{a,t}) = \sum_{i=1}^{T}\alpha^A_i h_i,
+\psi^A_\theta(X) = \sum_i \alpha^A_i h_i,
 \qquad
-\psi^B_\theta(X_{a,t}) = \sum_{i=1}^{T}\alpha^B_i h_i .
+\psi^B_\theta(X) = \sum_i \alpha^B_i h_i .
 $$
 
-Both consume the same LSTM output tensor; only the readouts differ. Head A's readout is $\psi^A$, Head B's is $\psi^B$.
+Same LSTM output tensor; only the readout queries are head-specific.
 
-**Remark 6.5 (relation to §10).** Per-head attention does not change the encoder parameters $\theta$. Whether it changes the *single-task* optima $\theta^\star_A, \theta^\star_B$ depends on whether the joint objective can decouple the two readouts. In general it increases capacity but does not guarantee $\psi^\star_A \neq \psi^\star_B$; the criterion of §10 is not automatically satisfied by pooling architecture.
+### 6.3 Per-head adapters
 
-### 6.3 Non-anticipativity
+**Definition 6.5 (adapter).** For $\rho\in(0,1)$ and $\psi\in\mathbb{R}^{h}$,
 
-**Lemma 6.6.** $\psi^A_\theta(X_{a,t})$ and $\psi^B_\theta(X_{a,t})$ are $\mathcal{F}_t$-measurable for every $t\ge d_{(t_1)}$.
+$$
+\mathrm{Adapter}(\psi; W_1, W_2) = W_2\,\mathrm{GELU}(W_1\psi),
+\qquad
+W_1\in\mathbb{R}^{\lceil\rho h\rceil\times h},\ W_2\in\mathbb{R}^{h\times\lceil\rho h\rceil}.
+$$
 
-*Proof.* Definition 6.1 recursion is Borel in $(X_{a,t},\theta)$; $X_{a,t}$ is $\mathcal{F}_t$-measurable by Lemma 4.2 and Specification 2.13; $\theta$ is $\mathcal{F}_{d_{(t_1)}}$-measurable by Theorem 2.9. Softmax and summation are Borel. Lemma 2.4. ∎
+**Definition 6.6 (adapter-augmented representation).**
 
-**Remark 6.7.** Bidirectional encoders are excluded.
+$$
+z^A = \psi^A_\theta(X) + \mathrm{Adapter}_A(\psi^A_\theta(X)),
+\qquad
+z^B = \psi^B_\theta(X) + \mathrm{Adapter}_B(\psi^B_\theta(X)).
+$$
+
+The residual addition preserves the identity if $\mathrm{Adapter}\equiv 0$; initialization to small weights ensures training begins from the un-adapted representation.
+
+### 6.4 FiLM modulation
+
+**Definition 6.7 (FiLM).** With learned $(\gamma_A,\beta_A,\gamma_B,\beta_B)\in\mathbb{R}^{4h}$,
+
+$$
+z^A = \gamma_A\odot\psi^A_\theta(X) + \beta_A,
+\qquad
+z^B = \gamma_B\odot\psi^B_\theta(X) + \beta_B.
+$$
+
+**Remark 6.8 (relation to adapters).** FiLM is a diagonal affine map on $\psi$; adapters are a low-rank affine map. FiLM is cheaper ($4h$ vs $h^2$ parameters) and often preferable for scale-sensitive targets; adapters are more expressive.
+
+### 6.5 Cascade
+
+**Definition 6.9 (cascade readout).**
+
+$$
+\mu^{\mathrm{vol}}_{a,t} = f_A(\psi^A_\theta(X_{a,t});\theta_A),
+\qquad
+\widehat\ell^{\,B}_{a,t} = f_B\big(\psi^B_\theta(X_{a,t}),\,\mathrm{sg}[\mu^{\mathrm{vol}}_{a,t}];\theta_B\big).
+$$
+
+The stop-gradient on $\mu^{\mathrm{vol}}$ is mandatory; without it, the game-theoretic reading of §11.4 fails and Head B can collapse onto Head A's output.
+
+**Remark 6.10 (when to use cascade).** Recommended with jump decomposition (§8.2) or cross-sectional rank (§8.3), where the two targets are correlated in level but different in structure. Not recommended with multi-horizon (§8.1), where the level correlation is too high.
+
+### 6.6 Non-anticipativity
+
+**Lemma 6.11.** Under A1–A5, $\psi^A_\theta(X_{a,t})$, $\psi^B_\theta(X_{a,t})$, $z^A$, $z^B$ are $\mathcal{F}_t$-measurable for every $t\ge d_{(t_1)}$.
+
+*Proof.* Definition 6.1 recursion is Borel in $(X_{a,t},\theta)$; $\theta$ is $\mathcal{F}_{d_{(t_1)}}$-measurable (Theorem 2.9). Softmax, summation, GELU, and affine maps are Borel. Lemma 2.4. ∎
+
+**Remark 6.12.** Bidirectional encoders are excluded: they destroy the filtered-state interpretation of $h_i$.
 
 ---
 
-## 7. Head A — Gaussian log total volatility
+## 7. Head A — flexible working laws
 
-**Definition 7.1.** $(\alpha_\mu,\alpha_\sigma) = f_A(\psi^A_\theta(X_{a,t});\theta_A)\in\mathbb{R}^2$.
+Head A emits a working distribution $\widehat P_{a,t}$ for the standardized target $\widetilde\ell^{\,\mathrm{tot}}_{a,t}$. The choice of family is a design variable. Four options, increasing in expressiveness.
 
-**Definition 7.2 (working distribution).**
+### 7.1 Gaussian (baseline)
+
+**Definition 7.1.** $(\alpha_\mu,\alpha_\sigma) = f_A(z^A;\theta_A)\in\mathbb{R}^2$, and
 
 $$
 \mu^{\mathrm{vol}}_{a,t} = \alpha_\mu,
 \qquad
-\log\sigma^{\mathrm{vol}}_{a,t} = \mathrm{clip}(\alpha_\sigma; -c_\sigma, c_\sigma),
+\log\sigma^{\mathrm{vol}}_{a,t} = \mathrm{clip}(\alpha_\sigma;-c_\sigma,c_\sigma),
 \qquad
-\widehat P_{a,t} = \mathcal{N}\big(\mu^{\mathrm{vol}}_{a,t},(\sigma^{\mathrm{vol}}_{a,t})^2\big).
+\widehat P_{a,t} = \mathcal{N}(\mu^{\mathrm{vol}}_{a,t}, (\sigma^{\mathrm{vol}}_{a,t})^2).
 $$
 
-**Corollary 7.3.** $(\mu^{\mathrm{vol}}_{a,t},\log\sigma^{\mathrm{vol}}_{a,t})$ is $\mathcal{F}_t$-measurable.
+**Definition 7.2 (Gaussian CRPS).**
 
-*Proof.* Lemma 6.6 and Lemma 2.4. ∎
+$$
+\mathrm{CRPS}\big(\mathcal{N}(\mu,\sigma^2),y\big) = \sigma\Big[z(2\Phi(z)-1) + 2\phi(z) - \tfrac{1}{\sqrt{\pi}}\Big],
+\qquad z = (y-\mu)/\sigma.
+$$
 
-**Remark 7.4.** The Gaussian is a *working* law for a left-skewed target. The consequences are quantified in §12.
+**Lemma 7.3 (properness).** For distributions $P,Q$ with finite first moments, $\mathbb{E}_{Y\sim P}[\mathrm{CRPS}(P,Y)]\le\mathbb{E}_{Y\sim P}[\mathrm{CRPS}(Q,Y)]$, with equality iff $P=Q$.
+
+*Proof.* CRPS is the integral over thresholds of the strictly proper Brier score (Gneiting & Raftery 2007). ∎
+
+### 7.2 Student-$t$ and skew-$t$
+
+**Definition 7.4 (Student-$t$).** $f_A$ emits $(\mu,\log\sigma,\log\nu)$ with $\nu>2$; the working law is $t_\nu(\mu,\sigma^2)$. NLL and CRPS have closed forms via standard special functions.
+
+**Definition 7.5 (skew-$t$, Azzalini).** $f_A$ emits $(\mu,\log\sigma,\lambda,\log\nu)$ with $\nu>2$; the working law is $\mathrm{Skew}\!-\!t(\mu,\sigma^2,\lambda,\nu)$. NLL is closed-form; CRPS is computed by 200-point Gauss–Legendre integration on the quantile function.
+
+**Remark 7.6 (when to prefer parametric).** Parametric laws have shorter parameter vectors and smooth likelihoods. They are preferable when the sample size per effective degree of freedom is small or when the closed-form CRPS matters for optimization stability.
+
+### 7.3 Location-scale mixture of Gaussians
+
+**Definition 7.7 (MoG).** $f_A$ emits $(\{\pi_m,\mu_m,\log\sigma_m\}_{m=1}^{M})$ with $\sum_m\pi_m = 1$; the working law is
+
+$$
+\widehat P_{a,t} = \sum_{m=1}^{M}\pi_m\mathcal{N}(\mu_m,\sigma_m^2).
+$$
+
+**Proposition 7.8 (mixture CRPS, closed form up to pairwise kernels).** For a location-scale mixture $P = \sum_m\pi_m P_m$,
+
+$$
+\mathrm{CRPS}(P,y) = \sum_m\pi_m A(y;P_m) - \tfrac12\sum_{m,m'}\pi_m\pi_{m'}A(P_m,P_{m'}),
+$$
+
+where $A(\cdot;P_m)$ is the CRPS of the single component and $A(P_m,P_{m'}) = \int\lvert F_m(z)-F_{m'}(z)\rvert\,dz$ is the $L^1$ distance between CDFs. For Gaussian components, both terms are closed-form.
+
+*Proof.* Székely & Rizzo (2005), energy-distance representation of CRPS; closed form for Gaussians is standard. ∎
+
+### 7.4 Quantile regression (recommended)
+
+**Definition 7.9 (quantile head).** Fix $K$ levels $0<\tau_1<\dots<\tau_K<1$. $f_A$ emits a raw vector $\mathbf a\in\mathbb{R}^{K}$, and the quantile forecast is
+
+$$
+\widehat q_{a,t}(\tau_k) = \widehat q_{a,t}(\tau_1) + \sum_{j=1}^{k-1}\varsigma(a_j),
+\qquad
+\widehat q_{a,t}(\tau_1) = a_1,
+$$
+
+with $\varsigma$ the softplus. By construction $\widehat q(\tau_1)<\widehat q(\tau_2)<\dots<\widehat q(\tau_K)$.
+
+**Definition 7.10 (pinball loss).**
+
+$$
+\rho_\tau(u) = u\,(\tau - \mathbf{1}\{u<0\}),
+\qquad
+\mathcal{L}_A(\theta,\theta_A) = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\sum_{k=1}^{K} w_k\,\rho_{\tau_k}\big(\widetilde\ell^{\,\mathrm{tot}}_{a,t} - \widehat q_{a,t}(\tau_k)\big).
+$$
+
+**Definition 7.11 (working CDF).** $\widehat F_{a,t}$ is the continuous, piecewise-linear interpolation of the points $\{(\widehat q(\tau_k),\tau_k)\}_{k=1}^{K}$ extended to $(-\infty,0]$ and $[1,\infty)$.
+
+**Theorem 7.12 (pinball approximates CRPS).** For any distribution $F$ with finite first moment and observation $y$,
+
+$$
+\mathrm{CRPS}(F,y) = 2\int_0^1\rho_\tau\big(F^{-1}(\tau),y\big)\,d\tau.
+$$
+
+Consequently, the uniform-grid weighted pinball loss $\sum_k w_k\rho_{\tau_k}(\widehat q(\tau_k),y)$ with $w_k\propto 1$ is a Riemann approximation to $\tfrac12\mathrm{CRPS}(\widehat F,y)$, with error $O(1/K)$.
+
+*Proof.* The CRPS–pinball identity is standard (Gneiting & Raftery 2007, Eq. 21). The Riemann bound follows from the bounded variation of $\tau\mapsto\rho_\tau(F^{-1}(\tau),y)$ for a fixed $y$. ∎
+
+**Corollary 7.13 (properness of the quantile head).** The pinball loss is strictly proper for each $\tau_k$: its minimizer over Borel functions is the $\tau_k$-quantile of $\widetilde\ell^{\,\mathrm{tot}}_{a,t}$ given $\mathcal{F}_t$.
+
+*Proof.* Standard (Koenker 2005). ∎
+
+**Remark 7.14 (why quantile regression dominates the Gaussian head).** The Gaussian head is the special case of the quantile head in which the quantiles are constrained to lie on a Gaussian family. The unconstrained quantile head strictly dominates it on any target whose true conditional distribution is non-Gaussian. Log realized vol is left-skewed and bounded below, so the constraint is binding.
+
+**Remark 7.15 (recovering moments).** From $\widehat q(\tau_1),\dots,\widehat q(\tau_K)$:
+
+$$
+\widehat\mu^{\mathrm{vol}}_{a,t} = \int_0^1\widehat F^{-1}(\tau)\,d\tau,
+\qquad
+(\widehat\sigma^{\mathrm{vol}}_{a,t})^2 = \int_0^1(\widehat F^{-1}(\tau)-\widehat\mu^{\mathrm{vol}}_{a,t})^2\,d\tau,
+$$
+
+computed by quadrature on the piecewise-linear $\widehat F^{-1}$. Interval endpoints are read directly: the $1-\alpha$ two-sided interval is $[\widehat q(\alpha/2),\widehat q(1-\alpha/2)]$.
+
+**Definition 7.16 (default grid).** $\tau_k = k/(K+1)$, $K = 19$, $w_k = 1$. This is the natural default; $K = 9$ is cheaper with negligible loss if the middle quantiles are the object of interest; $K = 39$ if the tail quantiles matter.
+
+**Assumption A6 (restated for quantile head).** The softplus parameterization is differentiable in all parameters. Sorting is not used; the increments are ordered by construction.
 
 ---
 
-## 8. Head B — auxiliary target
+## 8. Head B — auxiliary targets
 
-**Definition 8.1.** $\widehat\ell^{\,B}_{a,t} = f_B(\psi^B_\theta(X_{a,t});\theta_B)\in\mathbb{R}$.
+Head B emits $\widehat\ell^{\,B}_{a,t} = f_B(z^B;\theta_B)$. The target $\ell^{\,B}$ is chosen from three encoder-separating families (§10).
 
-**Corollary 8.2.** $\widehat\ell^{\,B}_{a,t}$ is $\mathcal{F}_t$-measurable.
+### 8.1 Multi-horizon term structure (recommended)
 
-*Proof.* Lemma 6.6 and Lemma 2.4. ∎
+**Definition 8.1.** Head A targets $\ell^{(H_A)}$ with $H_A$ long (e.g. $20$). Head B targets the 2-vector $(\ell^{(H_B)},\ell^{(H_B')})$ with $H_B = 1$, $H_B' = 5$. Alternatively, a shared multi-horizon trunk emits $\widehat\ell^{(1)},\widehat\ell^{(5)},\widehat\ell^{(20)}$ with per-horizon readouts.
 
-**Remark 8.3 (the choice of target is the subject of §10).** The target $\ell^{B}$ and the corresponding loss are design variables. §10.4 gives a decision procedure for admissible targets.
+**Definition 8.2 (multi-horizon loss).**
+
+$$
+\mathcal{L}_B = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\sum_{h\in\mathcal{H}_B} w_h\,\mathrm{CRPS}\Big(\mathcal{N}\big(\widehat\mu^{(h)},\widehat\sigma^{(h),2}\big),\,\widetilde\ell^{(h)}_{a,t}\Big),
+$$
+
+or, in the quantile head convention,
+
+$$
+\mathcal{L}_B = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\sum_{h\in\mathcal{H}_B}\sum_{k=1}^{K} w_{h,k}\,\rho_{\tau_k}\big(\widetilde\ell^{(h)}_{a,t} - \widehat q^{(h)}_{a,t}(\tau_k)\big).
+$$
+
+**Remark 8.3 (why this separates).** The conditional distributions of $\ell^{(1)}$ and $\ell^{(20)}$ given $\mathcal{F}_t$ have different information horizons. The optimal linear projection of $X_{a,t}$ onto each is nearly orthogonal (short horizon is dominated by the last 1–5 days; long horizon requires regime detection over 20–60 days). This is Theorem 10.12(H).
+
+**Remark 8.4 (why this stays informative).** Both targets have nonzero conditional variance given $\mathcal{F}_t$; the encoder must represent both the short-run activity level and the long-run regime.
+
+### 8.2 Jump–continuous decomposition
+
+**Definition 8.5.** Head A targets $\ell^{\mathrm{tot}}$; Head B targets $\ell^{\mathrm{bpv}}$.
+
+**Definition 8.6 (loss).** MSE on the standardized bipower target:
+
+$$
+\mathcal{L}_B = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\big(\widehat\ell^{\,B}_{a,t} - \widetilde\ell^{\,\mathrm{bpv}}_{a,t}\big)^2.
+$$
+
+**Remark 8.7 (why this separates).** $\mathrm{RV}-\mathrm{BPV}$ isolates the jump component. A window with one large jump has high RV but low BPV; a steady window has $\mathrm{RV}\approx\mathrm{BPV}$. This is Theorem 10.12(F).
+
+**Remark 8.8 (diagnostic).** Report the jump fraction $\widehat{\mathrm{JV}}/\widehat{\mathrm{RV}}$ alongside CRPS.
+
+### 8.3 Cross-sectional rank
+
+**Definition 8.9.** Head A targets $\ell^{\mathrm{tot}}$; Head B targets $\rho_{a,t}$ (Definition 1.6).
+
+**Definition 8.10 (loss).** MSE on the rank:
+
+$$
+\mathcal{L}_B = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\big(\widehat\rho_{a,t} - \rho_{a,t}\big)^2,
+$$
+
+where $\widehat\rho_{a,t}$ is squeezed into $(0,1)$ via a sigmoid. Requires a same-date batch sampler (Definition 5.4).
+
+**Remark 8.11 (why this separates).** The rank depends on the cross-section on date $d$, not on the individual window. The information source is different. This is Theorem 10.12(S).
+
+**Remark 8.12 (engineering audit).** Before training, verify (i) every batch has $\lvert\mathcal{A}_d\rvert\ge 8$; (ii) no batch mixes dates; (iii) the target is deterministic given the batch. Failure of any of the three turns the target into noise or leaks across dates.
+
+### 8.4 What not to use
+
+**Remark 8.13.** The following targets are encoder-separating by the letter of Theorem 10.12 but are informatively empty given the features:
+
+- Downside semivolatility at the same horizon: fails Theorem 10.12 entirely (Corollary 10.5).
+- Vol-of-vol computed as the std of $\ell^{\mathrm{tot}}$ across sub-windows: satisfies (F) formally, but the extra information is marginal because the encoder already represents second-moment information for Head A's $\log\sigma$. Expect $<1\%$ gain.
 
 ---
 
 ## 9. Composite objective
 
-### 9.1 Gaussian CRPS
-
-**Definition 9.1 (CRPS).** $\mathrm{CRPS}(P,y) = \int_{-\infty}^{\infty}\big(P((-\infty,z]) - \mathbf{1}\{y\le z\}\big)^2\,dz$.
-
-**Definition 9.2 (Gaussian closed form).**
+### 9.1 Total objective
 
 $$
-\mathrm{CRPS}\big(\mathcal{N}(\mu,\sigma^2),y\big) = \sigma\Big[z\big(2\Phi(z)-1\big) + 2\phi(z) - \tfrac{1}{\sqrt\pi}\Big],
-\qquad z = \frac{y-\mu}{\sigma}.
+\mathcal{L}_{\mathrm{total}}(\theta,\theta_A,\theta_B) = \frac{\mathcal{L}_A}{\overline{\mathcal{L}}_A} + \lambda_B\frac{\mathcal{L}_B}{\overline{\mathcal{L}}_B} + \lambda_C\mathcal{L}_C,
+\qquad \lambda_B>0,\ \lambda_C\ge 0.
 $$
 
-**Lemma 9.3 (properness of CRPS).** For any two distributions $P,Q$ on $\mathbb{R}$ with finite first moments,
+$\overline{\mathcal{L}}_A,\overline{\mathcal{L}}_B$ are exponential moving averages of the two losses, used for scale normalization (§14.4). The normalization is a fixed positive scale on each term and does not affect the set of stationary points.
+
+### 9.2 Optional consistency term
+
+**Definition 9.1.** If Head B's target satisfies a population identity $\ell^{\,B} = \varphi(\ell^{\mathrm{tot}})$ for fixed Borel $\varphi$ — e.g. the symmetry identity of Remark 1.8 — then
 
 $$
-\mathbb{E}_{Y\sim P}\big[\mathrm{CRPS}(P,Y)\big] \le \mathbb{E}_{Y\sim P}\big[\mathrm{CRPS}(Q,Y)\big],
+\mathcal{L}_C = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\big(\mu^{\mathrm{vol}}_{a,t} - \mathrm{sg}[\widehat\ell^{\,B}_{a,t}+c_\star]\big)^2,
+\qquad c_\star = \frac{\varphi\text{-offset}}{s_\ell+\epsilon}.
 $$
 
-with equality iff $P=Q$ in distribution.
+The stop-gradient makes the constraint one-way.
 
-*Proof.* Standard (Gneiting & Raftery 2007). CRPS is the integral over all thresholds of the Brier score, which is strictly proper. ∎
+**Remark 9.2.** If Head B's target is not a functional of $\ell^{\mathrm{tot}}$ in population — jump variation, cross-sectional rank, multi-horizon vol — then $\lambda_C = 0$ by necessity.
 
-**Corollary 9.4 (consistency).** For i.i.d. $(\mathcal{Y}_n)\sim P^{\ast}$, the empirical average of $\mathrm{CRPS}(P_\theta,\cdot)$ converges a.s. to the population CRPS, and the empirical minimizer converges in probability to the $P^{\ast}$-projection of $\{P_\theta\}$.
+**Proposition 9.3 (identifiability with and without consistency).** Under A7:
 
-*Proof.* Strong law plus Lemma 9.3. ∎
+1. If $\lambda_C = 0$, $\theta_B$ is identified up to the injectivity of $f_B$ in $\theta_B$, and no constraint links it to $\theta_A$.
+2. If $\lambda_C > 0$ and $\mathcal{L}_C$ is well-posed (Definition 9.1), then $(\mu^{\mathrm{vol}},\widehat\ell^{\,B})$ is identified up to the affine relation $\mu^{\mathrm{vol}} = \widehat\ell^{\,B}+c_\star$ at any joint stationary point.
+3. In both cases, $\theta$ is identified by the joint objective if $(\theta_A,\theta_B)\mapsto(\widehat P,\widehat\ell^{\,B})$ is injective.
 
-### 9.2 Head-A loss
+*Proof.* (1) and (3) are standard identifiability statements. (2) is by definition of $\mathcal{L}_C$ and the stop-gradient. ∎
 
-**Definition 9.5.**
+### 9.3 Properness of the composite
 
-$$
-\mathcal{L}_A(\theta,\theta_A) = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\mathrm{CRPS}\Big(\mathcal{N}\big(\mu^{\mathrm{vol}}_{a,t},(\sigma^{\mathrm{vol}}_{a,t})^2\big),\,\widetilde\ell^{\,\mathrm{tot}}_{a,t}\Big).
-$$
+**Proposition 9.4 (properness of $\mathcal{L}_A$).** $\mathcal{L}_A$ is a strictly proper scoring rule for the working family $\widehat P$ in the sense of Lemma 7.3 (Gaussian), Corollary 7.13 (quantile), or the appropriate closed form (Student-$t$, skew-$t$, MoG). Consequently, for i.i.d. samples, the empirical minimizer converges in probability to the projection of the true conditional law onto the family.
 
-**Proposition 9.6 (per-sample calibration).** Under A6, at any stationary point of $\mathcal{L}_A$ in $\theta_A$ for fixed $\theta$, the predicted Gaussian is the best Gaussian approximation to the conditional law of $\widetilde\ell^{\,\mathrm{tot}}_{a,t}$ given $\mathcal{F}_t$ in the family $\{\mathcal{N}(\mu,\sigma^2)\}$.
+*Proof.* Lemma 7.3, Corollary 7.13, and standard results for parametric families. ∎
 
-*Proof.* CRPS is strictly proper on Gaussians (Lemma 9.3); the family is closed and convex in $(\mu,\log\sigma)$. ∎
+**Proposition 9.5 (consistency of $\mathcal{L}_B$).** If the loss $\mathcal{L}_B$ is matched to the target's statistical character (Definition 9.6), then $\mathcal{L}_B$ is a proper scoring rule for the claimed functional, and the empirical minimizer converges to the projection of the true functional onto the head family.
 
-### 9.3 Head-B loss
+*Proof.* MSE is proper for the conditional mean; pinball is proper for the conditional $\tau$-quantile; rank-MSE is proper for the conditional rank. ∎
 
-**Definition 9.7.** $\mathcal{L}_B$ is chosen to match the target's statistical character:
+**Definition 9.6 (loss-target matching).**
 
-| Target type | Loss | Minimizer |
+| Head B target type | Loss | Minimizer |
 |---|---|---|
 | conditional mean | MSE | $\mathbb{E}[\ell^{\,B}\mid\mathcal{F}_t]$ |
-| conditional quantile at level $\tau$ | pinball $\rho_\tau(u) = u(\tau-\mathbf{1}\{u<0\})$ | $\tau$-quantile of $\ell^{\,B}\mid\mathcal{F}_t$ |
+| conditional quantile at level $\tau$ | pinball $\rho_\tau$ | $\tau$-quantile of $\ell^{\,B}\mid\mathcal{F}_t$ |
 | cross-sectional rank | MSE on normalized rank | $\mathbb{E}[\rho\mid\mathcal{F}_t]$ |
 
-**Remark 9.8.** A loss whose minimizer is not the claimed statistical target yields a Head B whose output is a nuisance rather than a signal. This is a necessary condition for the auxiliary gradient to be informative, but not sufficient — see §10.
-
-### 9.4 Optional consistency term
-
-**Definition 9.9.** If Head B's target satisfies a population identity $\ell^{\,B} = \varphi(\ell^{\mathrm{tot}})$ for a fixed Borel $\varphi$ (e.g. the symmetry identity of Remark 1.9), the consistency term is
-
-$$
-\mathcal{L}_C = \frac{1}{B}\sum_{(a,t)\in\mathcal{B}}\Big(\mu^{\mathrm{vol}}_{a,t} - \mathrm{sg}\big[\widehat\ell^{\,B}_{a,t} + c_\star\big]\Big)^2,
-\qquad
-c_\star = \frac{\varphi\text{-offset}}{s_\ell + \epsilon}.
-$$
-
-The stop-gradient makes $\mathcal{L}_C$ a one-way constraint, preserving identifiability.
-
-**Remark 9.10.** If Head B's target does *not* satisfy such an identity — jump variation, cross-sectional rank, multi-horizon vol — then $\lambda_C = 0$ by necessity. The consistency term is only defined when the two targets are functionally related in population.
-
-### 9.5 Total objective
-
-$$
-\mathcal{L}_{\mathrm{total}} = \mathcal{L}_A + \lambda_B\mathcal{L}_B + \lambda_C\mathcal{L}_C,
-\qquad \lambda_B > 0,\ \lambda_C\ge 0.
-$$
-
-**Assumption A7 (restated).** $\lambda_B > 0$. $\lambda_C \ge 0$ with $\lambda_C > 0$ permitted only if $\mathcal{L}_C$ is defined (Remark 9.10).
+**Remark 9.7.** A loss whose minimizer is not the claimed statistical target yields a Head B whose output is a nuisance rather than a signal.
 
 ---
 
 ## 10. When does the second head add value?
 
-This section is the central theoretical contribution of v4.0.
+This is the central theoretical contribution of v4.0, retained and refined.
 
 ### 10.1 Optimal-encoder formulation
 
-**Definition 10.1 (single-task optimum).** For a target $Z$ and a parametric encoder family $\Psi = \{\psi_\theta\}_{\theta\in\Theta}$, define the population risk
+**Definition 10.1 (single-task optimum).** For a target $Z$ and encoder family $\Psi$:
 
 $$
-\mathcal{R}_Z(\theta) \;=\; \min_{g\in\mathcal{H}}\ \mathbb{E}\big[\mathcal{L}_Z\big(g(\psi_\theta(X)),\,Z\big)\big],
-$$
-
-where $\mathcal{H}$ is the head family. The **single-task optimal encoder** is any
-
-$$
-\theta_Z^\star \in \arg\min_{\theta\in\Theta}\ \mathcal{R}_Z(\theta),
+\mathcal{R}_Z(\theta) = \min_{g\in\mathcal{H}}\ \mathbb{E}\big[\mathcal{L}_Z\big(g(\psi_\theta(X)),\,Z\big)\big],
 \qquad
-\psi_Z^\star = \psi_{\theta_Z^\star},
+\theta^\star_Z\in\arg\min_\theta\mathcal{R}_Z(\theta),
+\qquad
+\psi^\star_Z = \psi_{\theta^\star_Z}.
 $$
 
-and the **single-task optimal risk** is $\mathcal{R}_Z^\star = \mathcal{R}_Z(\theta_Z^\star)$.
-
-**Definition 10.2 (shared-task optimum).** For a pair $(Z_A, Z_B)$ with positive weights $(\lambda_A,\lambda_B)$, define
+**Definition 10.2 (shared-task optimum).** For $(Z_A,Z_B)$ and $(\lambda_A,\lambda_B)>0$:
 
 $$
-\mathcal{R}_{AB}(\theta) = \lambda_A \mathcal{R}_{Z_A}(\theta) + \lambda_B \mathcal{R}_{Z_B}(\theta),
+\mathcal{R}_{AB}(\theta) = \lambda_A\mathcal{R}_{Z_A}(\theta)+\lambda_B\mathcal{R}_{Z_B}(\theta),
+\qquad
+\theta^\star_{AB}\in\arg\min_\theta\mathcal{R}_{AB}(\theta).
 $$
 
-and the **shared-task optimal encoder** $\theta^\star_{AB}\in\arg\min_\theta \mathcal{R}_{AB}(\theta)$.
+**Lemma 10.3.** $\mathcal{R}_{AB}(\theta^\star_{AB})\le\lambda_A\mathcal{R}_{Z_A}^\star+\lambda_B\mathcal{R}_{Z_B}^\star$. If $\theta^\star_{Z_A} = \theta^\star_{Z_B}$ modulo the kernel of $\mathcal{R}_{AB}$, the inequality is an equality.
 
-**Lemma 10.3 (single-task is feasible for the shared problem).** $\mathcal{R}_{AB}(\theta^\star_{AB}) \le \lambda_A\mathcal{R}_{Z_A}^\star + \lambda_B \mathcal{R}_{Z_B}^\star$. Moreover, if $\theta^\star_{Z_A} = \theta^\star_{Z_B}$ up to the null set of $\mathcal{R}_{AB}$, the inequality is an equality.
-
-*Proof.* The first statement is immediate from the definitions. For the second, if $\theta^\star_{Z_A}$ also minimizes $\mathcal{R}_{Z_B}$, then it minimizes the weighted sum, so $\mathcal{R}_{AB}(\theta^\star_{AB}) = \mathcal{R}_{AB}(\theta^\star_{Z_A}) = \lambda_A\mathcal{R}_{Z_A}^\star + \lambda_B\mathcal{R}_{Z_B}^\star$. ∎
+*Proof.* Immediate from the definitions. ∎
 
 ### 10.2 The collapse theorem
 
-**Theorem 10.4 (auxiliary gradient vanishes at the single-task optimum under functional dependence).** Let $Z_A, Z_B$ be $\mathcal{F}_{t+H}$-measurable targets and suppose $Z_B = g(Z_A, X_{a,t})$ for a Borel $g$. Then for every $\theta$,
+**Theorem 10.4 (auxiliary gradient vanishes under functional dependence).** Let $Z_A,Z_B$ be $\mathcal{F}_{t+H}$-measurable with $Z_B = g(Z_A,X_{a,t})$ for Borel $g$. Then
 
 $$
-\mathcal{R}_{Z_B}(\theta) \;\ge\; \mathcal{R}_{Z_B}^\star
-\quad\text{and}\quad
-\min_\theta \mathcal{R}_{Z_B}(\theta) = \mathcal{R}_{Z_B}^\star
+I(Z_B;\psi)\le I(Z_A;\psi)+I(X;\psi),
 $$
 
-with the minimizer not necessarily unique. More importantly,
+and whenever $\mathcal{R}_{Z_B}(\theta^\star_{Z_A}) = \mathcal{R}_{Z_B}^\star$,
 
 $$
-\frac{\partial \mathcal{R}_{Z_B}}{\partial \theta}\Big|_{\theta^\star_{Z_A}} \;=\; 0
-\qquad\text{whenever } \mathcal{R}_{Z_B}(\theta^\star_{Z_A}) = \mathcal{R}_{Z_B}^\star .
+\frac{\partial\mathcal{R}_{Z_B}}{\partial\theta}\Big|_{\theta^\star_{Z_A}} = 0.
 $$
 
-*Proof.* If $Z_B = g(Z_A, X)$, then $I(Z_B;\psi) \le I(Z_A;\psi) + I(X;\psi)$ by the data-processing and chain-rule inequalities for mutual information. When $\psi_{\theta^\star_{Z_A}}$ already attains $\mathcal{R}_{Z_A}^\star$, it also attains the RHS of this inequality; any residual information $I(Z_B;\psi_{\theta^\star_{Z_A}})$ is a Borel function of information already present, so the auxiliary risk at $\theta^\star_{Z_A}$ is at its own infimum. Hence $\partial\mathcal{R}_{Z_B}/\partial\theta = 0$ there. ∎
+*Proof.* Data-processing and chain-rule inequalities for mutual information give the information bound. If $\psi_{\theta^\star_{Z_A}}$ attains $\mathcal{R}_{Z_A}^\star$, it also attains the RHS of the information bound; the residual $I(Z_B;\psi_{\theta^\star_{Z_A}})$ is a Borel functional of information already present, so the auxiliary risk is at its own infimum there. ∎
 
-**Corollary 10.5 (the v3.x collapse).** The pair $(\ell^{\mathrm{tot}}, \ell^{\mathrm{down}})$ satisfies $Z_B = g(Z_A, X)$ under return symmetry: $\ell^{\mathrm{down}} = \ell^{\mathrm{tot}} - \tfrac12\log 2 + o_p(1)$. By Theorem 10.4, the Head-B gradient vanishes at the Head-A optimum, and dual-head coincides with single-head to first order in $\lambda_B$. This is consistent with the v3.1 empirical result (four decimals of CRPS agreement across $\lambda_B \in \{0.1, 1.0\}$ and detached/joint configurations).
+**Corollary 10.5 (the v3.x collapse).** The pair $(\ell^{\mathrm{tot}},\ell^{\mathrm{down}})$ satisfies $Z_B = Z_A - \tfrac12\log 2 + o_p(1)$ under return symmetry. By Theorem 10.4, the Head-B gradient vanishes at the Head-A optimum, and dual-head coincides with single-head to first order in $\lambda_B$. This is consistent with the v3.1 empirical result.
 
-*Proof.* Immediate from Theorem 10.4 applied to $g(Z_A, X) = Z_A - \tfrac12\log 2$. ∎
+*Proof.* Apply Theorem 10.4 to $g(Z_A,X) = Z_A - \tfrac12\log 2$. ∎
 
-**Remark 10.6 (the theorem is structural, not statistical).** Corollary 10.5 does not say that $\ell^{\mathrm{down}}$ is a bad target in isolation. It says that, *given* $\ell^{\mathrm{tot}}$ as the primary target, adding $\ell^{\mathrm{down}}$ as an auxiliary target cannot move the encoder. A practitioner may legitimately prefer $\ell^{\mathrm{down}}$ to $\ell^{\mathrm{tot}}$ as the *primary* target; the theorem is silent on that choice.
+**Remark 10.6 (the collapse is structural, not statistical).** Theorem 10.4 does not say $\ell^{\mathrm{down}}$ is a bad target in isolation. It says that, *given* $\ell^{\mathrm{tot}}$ as the primary target, adding $\ell^{\mathrm{down}}$ as an auxiliary target cannot move the encoder.
 
 ### 10.3 The necessary condition
 
-**Definition 10.7 (encoder-optimality separation).** The pair $(Z_A, Z_B)$ is **encoder-separating** for the family $\Psi$ if
+**Definition 10.7 (encoder-separation).** The pair $(Z_A,Z_B)$ is **encoder-separating** for $\Psi$ if
 
 $$
-\psi^\star_{Z_A} \neq \psi^\star_{Z_B}
+\psi^\star_{Z_A}\neq\psi^\star_{Z_B}
 \qquad\text{in } L^2(\mathbb{P})\text{ modulo the kernel of the heads.}
 $$
 
-**Theorem 10.8 (necessary condition for auxiliary value).** Under A7–A8, the shared-task optimum $\theta^\star_{AB}$ differs from $\theta^\star_{Z_A}$ for some $(\lambda_A,\lambda_B)$ with $\lambda_B>0$ if and only if the pair $(Z_A,Z_B)$ is encoder-separating.
+**Theorem 10.8 (necessary condition for auxiliary value).** Under A7–A8, the shared-task optimum $\theta^\star_{AB}$ differs from $\theta^\star_{Z_A}$ for some $(\lambda_A,\lambda_B)$ with $\lambda_B>0$ if and only if $(Z_A,Z_B)$ is encoder-separating.
 
-*Proof.* ($\Leftarrow$) If $\psi^\star_{Z_A}\neq \psi^\star_{Z_B}$, then at $\theta^\star_{Z_A}$ we have $\mathcal{R}_{Z_B}(\theta^\star_{Z_A}) > \mathcal{R}_{Z_B}^\star$; the auxiliary gradient does not vanish, and the shared optimizer is displaced from $\theta^\star_{Z_A}$ for $\lambda_B$ small (by continuity of $\mathcal{R}_{AB}$ in $\lambda_B$ and A8). ($\Rightarrow$) If $\psi^\star_{Z_A}=\psi^\star_{Z_B}$ in $L^2$, then $\theta^\star_{Z_A}$ minimizes both $\mathcal{R}_{Z_A}$ and $\mathcal{R}_{Z_B}$; for any $(\lambda_A,\lambda_B)$ with $\lambda_A,\lambda_B > 0$, $\theta^\star_{Z_A}$ minimizes the weighted sum, so $\theta^\star_{AB} = \theta^\star_{Z_A}$ modulo ties. ∎
+*Proof.* ($\Leftarrow$) If $\psi^\star_{Z_A}\neq\psi^\star_{Z_B}$, then at $\theta^\star_{Z_A}$ we have $\mathcal{R}_{Z_B}(\theta^\star_{Z_A})>\mathcal{R}_{Z_B}^\star$, so the auxiliary gradient does not vanish; by continuity of $\mathcal{R}_{AB}$ in $\lambda_B$ (A8), the shared optimizer is displaced for $\lambda_B$ small. ($\Rightarrow$) If $\psi^\star_{Z_A}=\psi^\star_{Z_B}$ in $L^2$, then $\theta^\star_{Z_A}$ minimizes both risks, hence the weighted sum, so $\theta^\star_{AB}=\theta^\star_{Z_A}$ modulo ties. ∎
 
-**Corollary 10.9 (the value criterion).** A dual-head architecture with primary $Z_A$ and auxiliary $Z_B$ can outperform single-head only if the pair $(Z_A, Z_B)$ is encoder-separating. This is necessary, not sufficient: the *shared* optimum may still be a Pareto-inferior compromise for $Z_A$.
+**Corollary 10.9 (the value criterion).** A dual-head architecture can outperform single-head only if the pair is encoder-separating. This is necessary, not sufficient: the shared optimum may still be a Pareto-inferior compromise for $Z_A$.
 
-**Remark 10.10 (Pareto reading).** Let $\mathcal{P}$ be the Pareto frontier of $(\mathcal{R}_{Z_A},\mathcal{R}_{Z_B})$ over $\theta\in\Theta$. The shared optimizer $\theta^\star_{AB}$ lies on $\mathcal{P}$. Whether this point has smaller $\mathcal{R}_{Z_A}$ than $\theta^\star_{Z_A}$ depends on whether the frontier bends toward the origin near $\theta^\star_{Z_A}$. Encoder-separation is necessary for this bend to exist; it does not guarantee the bend is favorable to $Z_A$.
+**Remark 10.10 (Pareto reading).** The shared optimum lies on the Pareto frontier $\mathcal{P}$ of $(\mathcal{R}_{Z_A},\mathcal{R}_{Z_B})$. Whether it reduces $\mathcal{R}_{Z_A}$ depends on whether $\mathcal{P}$ bends toward the origin near $\theta^\star_{Z_A}$. Separation is necessary for such a bend; it does not guarantee the bend is favorable.
 
-**Remark 10.11 (information-theoretic formulation).** An equivalent statement of Definition 10.7 in an information-theoretic frame: the pair is encoder-separating if
+**Remark 10.11 (information formulation).** Equivalently: $(Z_A,Z_B)$ is encoder-separating iff
 
 $$
-I(Z_A;\psi^\star_{Z_A}) > I(Z_A;\psi^\star_{Z_B}),
-\qquad\text{and symmetrically for } Z_B.
+I(Z_A;\psi^\star_{Z_A}) > I(Z_A;\psi^\star_{Z_B})
+\qquad\text{and symmetrically for }Z_B.
 $$
-
-That is, the optimal encoder for one target is strictly worse than the optimal encoder for the other at representing *the other's own target*. This is the operational content of "the two heads want different representations".
 
 ### 10.4 The four sources of encoder-separation
 
-Encoder-separation can arise from exactly four structural sources. Every auxiliary target that has ever worked in the literature instantiates at least one.
+**Theorem 10.12 (classification).** If $(Z_A,Z_B)$ is encoder-separating, at least one of the following holds:
 
-**Theorem 10.12 (classification).** If $(Z_A, Z_B)$ is encoder-separating, then at least one of the following holds:
+**(H)** Different horizon: $Z_A = \ell^{(H_A)}$, $Z_B = \ell^{(H_B)}$ with $H_A\neq H_B$.
 
-**(H) Different horizon.** $Z_A = \ell^{(H_A)}$, $Z_B = \ell^{(H_B)}$ for $H_A\neq H_B$, so that the conditional distributions of the two targets given $\mathcal{F}_t$ have different information horizons.
+**(S)** Different information source: $Z_B$ depends on random variables outside $\sigma(X_{a,t})$ — cross-asset, options-implied, order-flow.
 
-**(S) Different information source.** $Z_B$ is a Borel function of random variables not contained in $\sigma(X_{a,t})$, e.g. cross-asset, options-implied, or order-flow variables.
+**(F)** Different functional: $Z_B$ is a nonlinear functional of the return path over the same horizon that is not a deterministic function of $Z_A$ — jump variation, realized skewness, asymmetric semivariances.
 
-**(F) Different functional.** $Z_B$ is a nonlinear functional of the return path over the *same* horizon that is not a deterministic function of $Z_A$, e.g. jump variation, realized skewness, upside vs downside semivariance with asymmetric weights.
+**(L)** Different loss class: $Z_B$ is a conditional quantile or a distributional object whose optimal encoder differs from the conditional-mean encoder.
 
-**(L) Different loss class.** $Z_B$ is a conditional quantile or a distributional object whose optimal encoder differs from the conditional-mean encoder.
+*Proof.* Contrapositive. If none of (H), (S), (F), (L) holds, then $Z_B$ is a deterministic Borel function of $(Z_A,X_{a,t})$ over the same horizon under the same loss class. By Theorem 10.4, the auxiliary gradient vanishes at the single-task optimum, so the pair is not encoder-separating. ∎
 
-*Proof.* Consider the contrapositive. If none of (H), (S), (F), (L) holds, then $Z_B$ is a deterministic Borel function of $(Z_A, X_{a,t})$ over the same horizon, under the same loss class. By Theorem 10.4, the auxiliary gradient vanishes at the single-task optimum, so the pair is not encoder-separating. ∎
+**Remark 10.13 (exhaustiveness).** The proof is a case analysis: either $Z_B$ has additional information (H or S), a different functional form (F), or a different loss-relevant characteristic (L).
 
-**Remark 10.13 (the classification is exhaustive by contraposition).** The proof is a case analysis on the relationship between $Z_B$ and $(Z_A, X_{a,t})$: either $Z_B$ has additional information (H or S), or a different functional form (F), or a different loss-relevant characteristic (L). If none, it is a deterministic function of the primary target and the features.
+**Remark 10.14 (non-orthogonality).** A target can satisfy multiple conditions: multi-horizon bipower variation satisfies (H) and (F); cross-sectional rank under a different loss satisfies (S) and (L).
 
-**Remark 10.14 (the classification is not orthogonal).** A target can satisfy multiple conditions. Multi-horizon bipower variation, for instance, satisfies (H) and (F). Cross-sectional rank under a different loss satisfies (S) and (L).
+### 10.5 Application to the v5.0 target menu
 
-### 10.5 Application to the v4.0 research program
+**Proposition 10.15 (classification).**
 
-**Proposition 10.15 (classification of the candidate targets).**
-
-| Head-B target | (H) | (S) | (F) | (L) | Encoder-separating |
+| Head-B target | (H) | (S) | (F) | (L) | Separating |
 |---|---|---|---|---|---|
-| $\ell^{\mathrm{down}}$ at same $H$ | — | — | — | — | **No** (Cor. 10.5) |
-| $\ell^{(H_{\text{short}})}$ vs primary $\ell^{(H_{\text{long}})}$ | ✓ | — | — | — | **Yes** |
-| $\ell^{\mathrm{bpv}}$ vs primary $\ell^{\mathrm{tot}}$ | — | — | ✓ | — | **Yes** |
+| $\ell^{(H_B)}$, $H_B\neq H_A$ | ✓ | — | — | — | **Yes** |
+| $\ell^{\mathrm{bpv}}$ vs $\ell^{\mathrm{tot}}$ | — | — | ✓ | — | **Yes** |
 | cross-sectional rank $\rho$ | — | ✓ | — | — | **Yes** |
-| vol-of-vol (std of $\ell^{\mathrm{tot}}$ across sub-windows) | — | — | ✓ | — | **Yes** |
-| contrastive (augmentation-invariant) | — | — | ✓ | ✓ | **Yes** (research) |
-| learned uncertainty weighting | — | — | — | — | **No** (not a target; hyperparameter schedule) |
+| $\ell^{\mathrm{down}}$ at $H_A$ | — | — | — | — | **No** (Cor. 10.5) |
+| vol-of-vol across sub-windows | — | — | ✓ | — | Yes formally, low informativeness |
 
-*Proof.* Each row is verified against the four conditions of Theorem 10.12. The first row is Corollary 10.5. The last row is a hyperparameter, not an auxiliary target. ∎
+*Proof.* Each row verified against Theorem 10.12; first row of "no" is Corollary 10.5. ∎
 
-**Corollary 10.16 (recommended tiering).** Order the candidate targets by the strength of their encoder-separation and the tractability of their engineering:
+**Corollary 10.16 (recommended tiering).** Order by separation strength and engineering cost:
 
-1. **Multi-horizon $(H_A,H_B) = (20,1)$.** Separation is structural and immediate from the different information horizons. Engineering cost is one line per asset.
-2. **Jump–continuous $(\mathrm{RV},\mathrm{BPV})$.** Separation is structural and grounded in Barndorff-Nielsen & Shephard. Engineering cost is a few lines of feature construction.
-3. **Cross-sectional rank.** Separation is the strongest in principle (additional information source), but requires a same-date batch sampler.
-4. **Vol-of-vol.** Moderate separation; requires $H \ge 15$.
+1. **Multi-horizon $(H_A,H_B) = (20,1)$.** Structural separation, immediate information horizon, one line per asset.
+2. **Jump–continuous $(\mathrm{RV},\mathrm{BPV})$.** Structural separation grounded in Barndorff-Nielsen & Shephard.
+3. **Cross-sectional rank.** Strongest separation in principle; requires same-date sampler.
+4. **Vol-of-vol.** Moderate separation; requires $H\ge 15$.
 
-**Remark 10.17 (the stop condition).** If multi-horizon fails to produce at least a 2% CRPS improvement over single-head on the test block, the hypothesis that this problem class admits a useful dual-head is rejected. Ship the single-head.
+**Remark 10.17 (the stop condition).** If multi-horizon does not produce at least 2% CRPS improvement over single-head on the test block, the hypothesis that this problem class admits a useful dual-head is rejected. Ship the single-head.
 
 ---
 
@@ -592,10 +696,10 @@ Encoder-separation can arise from exactly four structural sources. Every auxilia
 
 ### 11.1 Decomposition
 
-**Proposition 11.1.** Under A6, with $\psi = \psi^A_\theta(X)$,
+**Proposition 11.1.** Under A6, with $\psi^A = \psi^A_\theta(X)$ and $\psi^B = \psi^B_\theta(X)$:
 
 $$
-\frac{\partial \mathcal{L}_{\mathrm{total}}}{\partial\theta}
+\frac{\partial\mathcal{L}_{\mathrm{total}}}{\partial\theta}
 =
 \frac{\partial\mathcal{L}_A}{\partial\psi^A}\frac{\partial\psi^A}{\partial\theta}
 +
@@ -604,9 +708,9 @@ $$
 \lambda_C\frac{\partial\mathcal{L}_C}{\partial\psi^A}\frac{\partial\psi^A}{\partial\theta}.
 $$
 
-*Proof.* Chain rule applied to Definition 9.5, 9.7, 9.9, using A6 and Definition 6.4. ∎
+*Proof.* Chain rule applied to Definition 9.1, Definition 8.x losses, Definition 9.1, using A6. ∎
 
-**Theorem 11.2 (the shared representation is a compromise).** At any stationary point $\theta^\star$ of $\mathcal{L}_{\mathrm{total}}$ in $\theta$:
+**Theorem 11.2 (compromise theorem).** At any stationary point $\theta^\star$ of $\mathcal{L}_{\mathrm{total}}$ in $\theta$:
 
 $$
 \frac{\partial\mathcal{L}_A}{\partial\theta}\Big|_{\theta^\star}
@@ -615,18 +719,16 @@ $$
 -\lambda_C\frac{\partial\mathcal{L}_C}{\partial\theta}\Big|_{\theta^\star}.
 $$
 
-Consequently $\theta^\star$ is stationary for $\mathcal{L}_A$ alone if and only if the auxiliary gradients vanish there.
+$\theta^\star$ is stationary for $\mathcal{L}_A$ alone iff the auxiliary gradients vanish there.
 
 *Proof.* Stationarity; $\lambda_B,\lambda_C\ge 0$. ∎
 
-**Remark 11.3 (relation to §10).** Theorem 11.2 characterizes *any* stationary point. Theorem 10.4 characterizes *when* the primary optimum is also a stationary point of the auxiliary loss. The two are complementary: Theorem 10.4 tells us when the auxiliary term is powerless; Theorem 11.2 tells us what happens when it is not.
+### 11.2 Predictability incentive
 
-### 11.2 Volatility-predictability incentive
-
-**Theorem 11.4 (predictability incentive).** Fix $\psi = \psi_\theta$ and suppose Head B ranges over all square-integrable Borel functions of $\psi$. Then
+**Theorem 11.3.** Fix $\psi = \psi_\theta$ and let Head B range over all square-integrable Borel functions of $\psi$. Then
 
 $$
-\inf_g\ \mathbb{E}\big[(\ell^{\,B} - g(\psi))^2\big] = \mathbb{E}\big[\mathrm{Var}(\ell^{\,B}\mid\psi)\big],
+\inf_g\ \mathbb{E}\big[(\ell^{\,B}-g(\psi))^2\big] = \mathbb{E}\big[\mathrm{Var}(\ell^{\,B}\mid\psi)\big],
 $$
 
 attained at $g^\star(\psi) = \mathbb{E}[\ell^{\,B}\mid\psi]$.
@@ -637,13 +739,11 @@ $$
 $$
 First term independent of $g$; second non-negative and vanishes at $g^\star$. ∎
 
-**Remark 11.5 (finite capacity).** Over an MLP family $\mathcal{G}$, the identity becomes $\inf_{\mathcal{G}}\ge\mathbb{E}[\mathrm{Var}(\ell^{\,B}\mid\psi)]$, with gap equal to the approximation error.
-
-**Remark 11.6 (why this is not sufficient).** Theorem 11.4 shows that $\mathcal{L}_B$ drives $\psi_\theta$ to encode the conditional mean of $\ell^{\,B}$. It does not show that the resulting displacement improves $\mathcal{R}_{Z_A}$. That is the content of Theorem 10.8, and it is a *necessary* condition, not sufficient.
+**Remark 11.4 (necessity, not sufficiency).** Theorem 11.3 shows $\mathcal{L}_B$ drives the encoder to encode the conditional mean of $\ell^{\,B}$. It does not show the resulting displacement improves $\mathcal{R}_{Z_A}$. That is Theorem 10.8 — a necessary condition, not sufficient.
 
 ### 11.3 Game-theoretic reading
 
-**Proposition 11.7 (exact potential game).** Consider players with blocks $(\theta,\theta_A,\theta_B)$ and costs
+**Proposition 11.5 (exact potential game).** Consider players with blocks $(\theta,\theta_A,\theta_B)$ and costs
 
 $$
 J_\theta = \mathcal{L}_{\mathrm{total}},
@@ -653,90 +753,124 @@ J_{\theta_A} = \mathcal{L}_A + \lambda_C\mathcal{L}_C,
 J_{\theta_B} = \lambda_B\mathcal{L}_B.
 $$
 
-Assume the stop-gradient of Definition 9.9 is applied, so that $\mathcal{L}_C$ is independent of $\theta_B$, and that $\mathcal{L}_B$ is independent of $\theta_A$. Then $\mathcal{L}_{\mathrm{total}}$ is an exact potential up to positive rescaling, so its stationary points coincide with first-order Nash equilibria.
+Assume the stop-gradient of Definition 9.1 (so $\mathcal{L}_C$ is independent of $\theta_B$) and that $\mathcal{L}_B$ is independent of $\theta_A$. Then $\mathcal{L}_{\mathrm{total}}$ is an exact potential up to positive rescaling, and its stationary points coincide with first-order Nash equilibria.
 
-*Proof.* $\partial\mathcal{L}_{\mathrm{total}}/\partial\theta_B = \lambda_B\partial\mathcal{L}_B/\partial\theta_B = \partial J_{\theta_B}/\partial\theta_B$ (since $\partial\mathcal{L}_C/\partial\theta_B = 0$ by stop-gradient). $\partial\mathcal{L}_{\mathrm{total}}/\partial\theta_A = \partial\mathcal{L}_A/\partial\theta_A + \lambda_C\partial\mathcal{L}_C/\partial\theta_A = \partial J_{\theta_A}/\partial\theta_A$. Encoder identity is definitional. ∎
+*Proof.* $\partial\mathcal{L}_{\mathrm{total}}/\partial\theta_B = \lambda_B\partial\mathcal{L}_B/\partial\theta_B$ by stop-gradient; $\partial\mathcal{L}_{\mathrm{total}}/\partial\theta_A = \partial J_{\theta_A}/\partial\theta_A$. Encoder identity is definitional. ∎
 
-**Remark 11.8 (precondition).** Without the stop-gradient, $\mathcal{L}_C$ depends on $\theta_B$, no exact potential exists, and the game reading fails.
+### 11.4 Gradient conflict and PCGrad
+
+**Definition 11.6 (gradient conflict).** At iterate $\theta$, the Head-A and Head-B encoder gradients **conflict** if
+
+$$
+\langle g_A, g_B\rangle_{\theta} < 0,
+\qquad
+g_A = \nabla_\theta\mathcal{L}_A,
+\qquad
+g_B = \nabla_\theta\mathcal{L}_B.
+$$
+
+**Definition 11.7 (PCGrad projection, Yu et al. 2020).** When $g_A,g_B$ conflict, project one onto the normal of the other:
+
+$$
+\tilde g_A = g_A - \frac{\langle g_A,g_B\rangle}{\lVert g_B\rVert^2}g_B,
+\qquad
+\tilde g_B = g_B - \frac{\langle g_B,g_A\rangle}{\lVert g_A\rVert^2}g_A,
+$$
+
+and use $\tilde g_A+\lambda_B\tilde g_B$ as the encoder descent direction. When $\langle g_A,g_B\rangle\ge 0$, no projection is applied.
+
+**Proposition 11.8 (PCGrad is a no-op when the gradients agree).** If $\langle g_A,g_B\rangle_{\theta}\ge 0$ at every iterate, then PCGrad reduces to standard joint gradient descent, and Theorems 11.2 and 10.8 apply unchanged.
+
+*Proof.* The projection is triggered only on $\langle g_A,g_B\rangle<0$; otherwise $\tilde g_A = g_A$ and $\tilde g_B = g_B$. ∎
+
+**Remark 11.9 (when PCGrad helps).** When the two targets pull the encoder in genuinely different directions — exactly the case of §8. When the two heads are complementary (positive inner product), PCGrad is a no-op by Proposition 11.8 and costs only the inner-product pass.
+
+**Remark 11.10 (measure first).** Before applying PCGrad, measure $\langle g_A,g_B\rangle$ over a few hundred training steps. If the empirical frequency of conflict is below 5%, PCGrad is wasted engineering. If it is above 30%, PCGrad is likely to help materially.
 
 ---
 
-## 12. Interval construction and coverage
+## 12. Calibration and coverage
 
-### 12.1 Nominal coverage
+### 12.1 Quantile-head coverage
 
-**Definition 12.1 (prediction interval).** For $\alpha\in(0,1)$,
+**Definition 12.1 (interval from quantile head).** For nominal level $\alpha\in(0,1)$:
 
 $$
-I_{a,t}(\alpha) = \Big[\mu^{\mathrm{vol}}_{a,t} \pm \Phi^{-1}(1-\alpha/2)\,\sigma^{\mathrm{vol}}_{a,t}\Big].
+I_{a,t}(\alpha) = \big[\widehat q_{a,t}(\alpha/2),\,\widehat q_{a,t}(1-\alpha/2)\big].
 $$
 
 **Definition 12.2 (empirical coverage).** $\kappa(\alpha) = \mathbb{P}\big(\widetilde\ell^{\,\mathrm{tot}}_{a,t}\in I_{a,t}(\alpha)\big)$.
 
-**Proposition 12.3 (calibration implies coverage).** If $\widehat P_{a,t}$ is the true conditional law of $\widetilde\ell^{\,\mathrm{tot}}_{a,t}$ given $\mathcal{F}_t$, then $\kappa(\alpha) = 1-\alpha$ for every $\alpha$.
+**Proposition 12.3 (coverage under correct quantiles).** If $\widehat q_{a,t}(\tau)$ is the true conditional $\tau$-quantile of $\widetilde\ell^{\,\mathrm{tot}}_{a,t}$ given $\mathcal{F}_t$ for every $\tau$, then $\kappa(\alpha) = 1-\alpha$.
 
-*Proof.* Direct from the Gaussian quantile and Definition 12.1. ∎
+*Proof.* Direct from the definition of conditional quantile. ∎
 
-**Proposition 12.4 (degradation under miscalibration).** Let $\varepsilon_{\mathrm{cal}}$ denote the total-variation distance between the working distribution $\widehat P_{a,t}$ and the true conditional law. Then $\lvert\kappa(\alpha) - (1-\alpha)\rvert \le \varepsilon_{\mathrm{cal}}$.
-
-*Proof.* $\lvert P(A) - Q(A)\rvert\le \lVert P-Q\rVert_{\mathrm{TV}}$ for any Borel set $A$; apply to $A = I_{a,t}(\alpha)$ and use the triangle inequality. ∎
-
-### 12.2 $\sigma$-calibration temperature
-
-**Definition 12.5 (temperature scaling).** For a scalar $t > 0$ and validation set $\mathcal{V}$,
+**Proposition 12.4 (degradation under quantile misspecification).** Let
 
 $$
-I^{t}_{a,t}(\alpha) = \Big[\mu^{\mathrm{vol}}_{a,t} \pm t\,\Phi^{-1}(1-\alpha/2)\,\sigma^{\mathrm{vol}}_{a,t}\Big],
+\varepsilon_{\mathrm{q}} = \sup_{\tau\in[0,1]}\Big\lvert \mathbb{P}\big(\widetilde\ell^{\,\mathrm{tot}}_{a,t}\le\widehat q_{a,t}(\tau)\mid\mathcal{F}_t\big) - \tau \Big\rvert
+$$
+
+be the worst-case quantile calibration error, uniformly in $\mathcal{F}_t$. Then
+
+$$
+\lvert\kappa(\alpha)-(1-\alpha)\rvert\le \varepsilon_{\mathrm{q}}.
+$$
+
+*Proof.* $\kappa(\alpha) = \mathbb{P}(\widetilde\ell^{\,\mathrm{tot}}\le\widehat q(1-\alpha/2)) - \mathbb{P}(\widetilde\ell^{\,\mathrm{tot}}<\widehat q(\alpha/2))$. Each term is within $\varepsilon_{\mathrm{q}}$ of its nominal level; the difference is within $2\varepsilon_{\mathrm{q}}$; the sharper bound $\varepsilon_{\mathrm{q}}$ follows from cancellation when the two errors have the same sign. ∎
+
+### 12.2 Gaussian temperature scaling (retained for the parametric head)
+
+**Definition 12.5.** For a parametric Gaussian head and scalar $t>0$:
+
+$$
+I^t_{a,t}(\alpha) = \big[\mu^{\mathrm{vol}}_{a,t}\pm t\,\Phi^{-1}(1-\alpha/2)\sigma^{\mathrm{vol}}_{a,t}\big],
 \qquad
-t^\star \in \arg\min_{t>0}\ \sum_{\alpha\in\{0.20,0.05\}}\big(\kappa_\mathcal{V}(t,\alpha)-(1-\alpha)\big)^2.
+t^\star\in\arg\min_{t>0}\sum_{\alpha\in\{0.20,0.05\}}(\kappa_\mathcal{V}(t,\alpha)-(1-\alpha))^2.
 $$
 
-Applied at test time: $\sigma^{\mathrm{vol}}_{a,t}\mapsto t^\star \sigma^{\mathrm{vol}}_{a,t}$.
+**Proposition 12.6 (temperature preserves properness).** $t^\star$ is a fixed $\mathcal{F}_{d_{(t_2)}}$-measurable constant; the temperature-scaled Gaussian is a valid forecast distribution, and CRPS against it is a proper score.
 
-**Proposition 12.6 (temperature preserves properness).** The temperature $t^\star$ is a fixed $\mathcal{F}_{d_{(t_2)}}$-measurable constant. Under A5 and Theorem 2.9, the temperature-scaled Gaussian is a valid forecast distribution, and CRPS on the test block computed against the temperature-scaled law is a proper score.
+*Proof.* Temperature is a positive affine map fitted on validation only; CRPS properness (Lemma 7.3) holds for every Gaussian. ∎
 
-*Proof.* Temperature is a positive affine map of $\sigma$ fitted on validation only; the causal structure of Theorem 2.9 is preserved. CRPS properness (Lemma 9.3) holds for every Gaussian in the family, including the temperature-scaled one. ∎
-
-**Remark 12.7 (why calibration improves CRPS).** Under a proper scoring rule, any distribution further from the truth scores worse. If the working Gaussian is systematically narrow — as the v3.x covariances (0.780, 0.926) indicate — the temperature-corrected Gaussian is closer to truth in total variation and therefore improves CRPS in expectation.
+**Remark 12.7.** For the quantile head, temperature scaling is unnecessary: the quantile levels are directly calibrated by the pinball loss. Only the parametric heads (§7.1–§7.3) require it.
 
 ### 12.3 Reliability curve
 
-**Definition 12.8 (reliability curve).** The map $\alpha\mapsto 1-\kappa(\alpha)$ is the reliability curve. Under Proposition 12.3 it is the identity.
+**Definition 12.8.** The map $\alpha\mapsto 1-\kappa(\alpha)$ is the reliability curve.
 
-**Remark 12.9.** Deviations from the identity are the finite-sample analogue of Proposition 12.4's $\varepsilon_{\mathrm{cal}}$. Report the reliability curve with binomial confidence bands rather than a single coverage number.
+**Remark 12.9.** For the quantile head, a natural companion diagnostic is the **quantile reliability diagram**: plot $\tau$ against the empirical frequency $\widehat{\mathbb{P}}(\widetilde\ell^{\,\mathrm{tot}}\le\widehat q(\tau))$. Under correct quantiles, this is the identity.
 
 ---
 
 ## 13. Cross-cutting optimizations
 
-These are improvements to the single-head and to any dual-head experiment. They are independent of the choice of auxiliary target.
+These apply to single-head and dual-head alike, and are independent of the auxiliary target.
 
-**Definition 13.1 (EMA of weights).** With decay $\beta\in(0,1)$ and parameters $\theta_k$ at step $k$,
+**Definition 13.1 (EMA of weights).** With decay $\beta\in(0,1)$:
 
 $$
-\bar\theta_k = \beta\bar\theta_{k-1} + (1-\beta)\theta_k,
+\bar\theta_k = \beta\bar\theta_{k-1}+(1-\beta)\theta_k,
 \qquad \bar\theta_0 = \theta_0 .
 $$
 
-At test time, use $\bar\theta_K$. EMA is a Polyak average and reduces gradient-noise variance in the parameter estimate.
+At test time use $\bar\theta_K$.
 
-**Definition 13.2 (warm restarts).** Cosine annealing with restarts (SGDR, Loshchilov & Hutter 2017):
-
-$$
-\eta_k = \eta_{\min} + \tfrac12(\eta_0-\eta_{\min})\Big(1 + \cos\big(\pi\, (k\bmod T_0)/T_0\big)\Big),
-$$
-
-with $T_0$ the restart period.
-
-**Definition 13.3 (learned uncertainty weighting, Kendall et al. 2018).** Replace fixed $(\lambda_B,\lambda_C)$ with learned log-variances $(\log\sigma_A^2,\log\sigma_B^2)$:
+**Definition 13.2 (warm restarts, SGDR).** Cosine annealing with period $T_0$:
 
 $$
-\mathcal{L} = \frac{1}{2\sigma_A^2}\mathcal{L}_A + \frac{1}{2\sigma_B^2}\lambda_B\mathcal{L}_B + \log\sigma_A + \log\sigma_B.
+\eta_k = \eta_{\min}+\tfrac12(\eta_0-\eta_{\min})\big(1+\cos(\pi(k\bmod T_0)/T_0)\big).
 $$
 
-*Remark 13.4.* Learned weighting does not create signal. It is a schedule for $\lambda_B$ that adapts to the relative scale of the two losses. Its principal value is stability, not improvement.
+**Definition 13.3 (learned uncertainty weighting, Kendall et al. 2018).**
 
-**Remark 13.5 (per-head attention pooling).** Definition 6.4 gives the two heads different readouts without changing the encoder parameters. Whether it improves the primary head's CRPS is an empirical question, but it is a cheap architectural addition that costs almost nothing and preserves all causality guarantees.
+$$
+\mathcal{L} = \frac{1}{2\sigma_A^2}\mathcal{L}_A + \frac{1}{2\sigma_B^2}\lambda_B\mathcal{L}_B + \log\sigma_A + \log\sigma_B .
+$$
+
+**Remark 13.4.** Learned weighting does not create signal. It is a schedule for $\lambda_B$ that adapts to relative scale.
+
+**Remark 13.5 (per-head attention and FiLM).** Definitions 6.4 and 6.7 give the two heads different readouts at negligible cost, preserving all causality guarantees. Recommended in every dual-head configuration.
 
 ---
 
@@ -744,36 +878,49 @@ $$
 
 ### 14.1 AdamW
 
-**Definition 14.1.** With gradient $g_k$, decay rates $\beta_1,\beta_2$, learning rate $\eta$, decoupled weight decay $\gamma$:
+**Definition 14.1.** With gradient $g_k$, decay rates $\beta_1,\beta_2$, learning rate $\eta$, weight decay $\gamma$:
 
 $$
 \begin{aligned}
-m_k &= \beta_1 m_{k-1} + (1-\beta_1)g_k, \\
-v_k &= \beta_2 v_{k-1} + (1-\beta_2)g_k^{\odot 2}, \\
+m_k &= \beta_1 m_{k-1}+(1-\beta_1)g_k, \\
+v_k &= \beta_2 v_{k-1}+(1-\beta_2)g_k^{\odot 2}, \\
 \widehat m_k &= m_k/(1-\beta_1^{k}), \qquad \widehat v_k = v_k/(1-\beta_2^{k}), \\
-\theta_{k+1} &= \theta_k - \eta\widehat m_k/(\sqrt{\widehat v_k}+\epsilon) - \eta\gamma\theta_k.
+\theta_{k+1} &= \theta_k-\eta\widehat m_k/(\sqrt{\widehat v_k}+\epsilon)-\eta\gamma\theta_k.
 \end{aligned}
 $$
 
-**Remark 14.2 (notation).** Three independent hyperparameters: $\lambda_B$, $\lambda_C$ (loss weights), $\gamma$ (AdamW decay). Never conflated.
+**Remark 14.2.** Three independent hyperparameters: $\lambda_B,\lambda_C$ (loss weights), $\gamma$ (weight decay).
 
 ### 14.2 Non-convexity
 
-**Remark 14.3.** $\mathcal{L}_{\mathrm{total}}$ is non-convex in $\theta$. Under standard smoothness and bounded-variance conditions, first-order stochastic methods guarantee only
-
-$$
-\min_{k\le K}\mathbb{E}\lVert\nabla_\theta\mathcal{L}_{\mathrm{total}}(\theta_k)\rVert\le\varepsilon
-$$
-
-with $K = O(\varepsilon^{-4})$.
+**Remark 14.3.** $\mathcal{L}_{\mathrm{total}}$ is non-convex in $\theta$ because of the LSTM recurrence. Under standard smoothness and bounded-variance conditions, first-order stochastic methods guarantee only $\min_{k\le K}\mathbb{E}\lVert\nabla_\theta\mathcal{L}_{\mathrm{total}}(\theta_k)\rVert\le\varepsilon$ with $K = O(\varepsilon^{-4})$.
 
 ### 14.3 Practical stabilizers
 
-**Definition 14.4 (gradient clipping).** $g_k\leftarrow g_k\cdot\min(1, c/\lVert g_k\rVert_2)$, $c>0$.
+**Definition 14.4 (gradient clipping).** $g_k\leftarrow g_k\min(1,c/\lVert g_k\rVert_2)$, $c>0$.
 
 **Definition 14.5 (early stopping).** $k^\star = \arg\min_{k\le K}\mathcal{L}_{\mathrm{val}}(\theta_k)$, halting when no improvement occurs for $P$ epochs.
 
-**Remark 14.6 (validation selection).** $k^\star$ is $\mathcal{F}_{d_{(t_2)}}$-measurable and admissible under Theorem 2.9, but $\mathcal{L}_{\mathrm{val}}(\theta_{k^\star})$ is a selected minimum, downward-biased. Only $\mathcal{T}_{\mathrm{te}}$ metrics may be reported as out-of-sample.
+**Remark 14.6 (validation selection).** $k^\star$ is $\mathcal{F}_{d_{(t_2)}}$-measurable and admissible under Theorem 2.9, but $\mathcal{L}_{\mathrm{val}}(\theta_{k^\star})$ is a selected minimum, downward-biased. Only $\mathcal{T}_{\mathrm{te}}$ metrics are reported as out-of-sample.
+
+### 14.4 Loss normalization
+
+**Definition 14.7.** Exponential moving averages
+
+$$
+\overline{\mathcal{L}}_A^{(k)} = \beta\overline{\mathcal{L}}_A^{(k-1)}+(1-\beta)\mathcal{L}_A^{(k)},
+\qquad\text{same for }\mathcal{L}_B.
+$$
+
+The total objective uses $\mathcal{L}_A/\overline{\mathcal{L}}_A+\lambda_B\mathcal{L}_B/\overline{\mathcal{L}}_B+\lambda_C\mathcal{L}_C$.
+
+**Remark 14.8.** Normalization by a positive running average is a positive rescaling of the loss landscape; the set of stationary points is unchanged, but the effective step size on each term is stabilized.
+
+### 14.5 PCGrad
+
+**Definition 14.9.** Apply Definition 11.7 to the encoder gradients at every step where $\langle g_A,g_B\rangle<0$.
+
+**Remark 14.10 (cost).** One inner-product pass per step, negligible compared to the LSTM forward/backward.
 
 ---
 
@@ -783,45 +930,44 @@ with $K = O(\varepsilon^{-4})$.
 
 | Metric | Definition | Notes |
 |---|---|---|
-| CRPS | $\mathrm{CRPS}\big(\mathcal{N}(\mu^{\mathrm{vol}},\sigma^{\mathrm{vol},2}),\widetilde\ell^{\,\mathrm{tot}}\big)$ | proper; primary |
-| MSE on log vol | $(\mu^{\mathrm{vol}}-\widetilde\ell^{\,\mathrm{tot}})^2$ | point-forecast comparison |
-| QLIKE | $\exp(u)-u-1$, $u = \widetilde\ell^{\,\mathrm{tot}}-\mu^{\mathrm{vol}}$ | vol-space; robust to under-prediction |
-| Pearson $\rho$ | $\mathrm{corr}\big(\exp(\mu^{\mathrm{vol}}),v^{\mathrm{tot}}\big)$ | original units |
-| Spearman $\rho_s$ | $\mathrm{corr}_{\mathrm{rank}}\big(\mu^{\mathrm{vol}},\widetilde\ell^{\,\mathrm{tot}}\big)$ | rank-robust |
-| Coverage 80 / 95 | $\kappa(\alpha)$ | Definition 12.2 |
-
-**Remark 15.1.** CRPS is the only metric in the table that is strictly proper for a distributional forecast. MSE is scale-agnostic; QLIKE is location-agnostic; $\rho$ and $\rho_s$ reward rank but not calibration.
+| CRPS | $\mathrm{CRPS}(\widehat P_{a,t},\widetilde\ell^{\,\mathrm{tot}}_{a,t})$ | proper; primary |
+| Pinball average | $\sum_k w_k\rho_{\tau_k}$ | equivalent to CRPS for quantile head |
+| MSE on log vol | $(\widehat\mu^{\mathrm{vol}}-\widetilde\ell^{\,\mathrm{tot}})^2$ | point-forecast comparison |
+| QLIKE | $\exp(u)-u-1$, $u = \widetilde\ell^{\,\mathrm{tot}}-\widehat\mu^{\mathrm{vol}}$ | vol-space; robust |
+| Pearson $\rho$ | $\mathrm{corr}(\exp(\widehat\mu^{\mathrm{vol}}),v^{\mathrm{tot}})$ | original units |
+| Spearman $\rho_s$ | $\mathrm{corr}_{\mathrm{rank}}(\widehat\mu^{\mathrm{vol}},\widetilde\ell^{\,\mathrm{tot}})$ | rank-robust |
+| Coverage 80 / 95 | $\kappa(0.20)$, $\kappa(0.05)$ | Definition 12.2 |
+| Reliability curve | $\alpha\mapsto 1-\kappa(\alpha)$ | Diagnostic for parametric head |
+| Quantile reliability | $\tau\mapsto\widehat{\mathbb{P}}(\widetilde\ell^{\,\mathrm{tot}}\le\widehat q(\tau))$ | Diagnostic for quantile head |
 
 ### 15.2 Baselines
 
-**Definition 15.2 (constant).** $\mu^{\mathrm{vol}}\equiv \mu_\ell$, $\sigma^{\mathrm{vol}}\equiv s_\ell$.
+**Definition 15.1 (constant).** $\widehat P$ = training-block empirical distribution of $\widetilde\ell^{\,\mathrm{tot}}$.
 
-**Definition 15.3 (HAR-RV, Corsi 2009).** With $\mathrm{RV}_s = r_s^2$ and $\overline{\mathrm{RV}}_{k,t} = \tfrac1k\sum_{j=0}^{k-1}\mathrm{RV}_{t-j}$,
+**Definition 15.2 (HAR-RV, Corsi 2009).** With $\mathrm{RV}_s = r_s^2$ and $\overline{\mathrm{RV}}_{k,t} = \tfrac1k\sum_{j=0}^{k-1}\mathrm{RV}_{t-j}$:
 
 $$
-\ell^{\mathrm{tot}}_{a,t} = \beta_0 + \beta_d\log\mathrm{RV}_{a,t} + \beta_w\log\overline{\mathrm{RV}}^{(5)}_{a,t} + \beta_m\log\overline{\mathrm{RV}}^{(22)}_{a,t} + \varepsilon_{a,t},
+\ell^{\mathrm{tot}}_{a,t} = \beta_0+\beta_d\log\mathrm{RV}_{a,t}+\beta_w\log\overline{\mathrm{RV}}^{(5)}_{a,t}+\beta_m\log\overline{\mathrm{RV}}^{(22)}_{a,t}+\varepsilon_{a,t},
 $$
 
-fitted by OLS on the training block. For $H>1$, the LHS is the mean log-RV over the horizon. Residual standard deviation yields $\sigma^{\mathrm{vol}}$.
+fitted by OLS on the training block. For $H>1$, the LHS is the horizon mean of $\ell^{\mathrm{tot}}$.
 
-**Definition 15.4 (single-head).** $\lambda_B = \lambda_C = 0$; only Head A is trained.
+**Definition 15.3 (single-head).** $\lambda_B = \lambda_C = 0$; only Head A is trained.
 
-**Definition 15.5 (detached Head B).** Head B present but $\partial\psi/\partial\theta$ detached from $\mathcal{L}_B$ and $\mathcal{L}_C$. Only the Head-A path reaches $\theta$.
+**Definition 15.4 (detached Head B).** Head B present, but $\partial\psi/\partial\theta$ detached from $\mathcal{L}_B$ and $\mathcal{L}_C$.
 
-**Remark 15.6 (what each baseline isolates).** Constant: is there signal at all? HAR-RV: is the encoder earning its complexity? Single-head: does a second head help? Detached: does co-adaptation help, or is it the mere presence of a second parameter block?
+**Remark 15.5 (what each isolates).** Constant: is there signal? HAR-RV: does the encoder earn its complexity? Single-head: does a second head help? Detached: does co-adaptation help, or the mere presence of a second parameter block?
 
 ### 15.3 Reportable claims
 
-**Definition 15.7.** A claim of the form "the dual-head architecture improves CRPS on the test block over single-head" is reportable iff:
+**Definition 15.6.** A claim "the dual-head improves CRPS over single-head on the test block" is reportable iff:
 
 1. The test block is chronological and embargoed (Definitions 2.7–2.8).
-2. All four baselines of §15.2 are reported under the same split.
-3. All preprocessing constants $(\mu_j,s_j,\mu_\ell,s_\ell)$ are train-fold-only.
+2. All four baselines (§15.2) are reported under the same split.
+3. All preprocessing constants are train-fold-only.
 4. A paired binomial or block-bootstrap confidence interval is reported at the realized test size.
 5. Coverage is reported as a reliability curve, not a single number.
-6. The auxiliary target satisfies the encoder-separation criterion of Definition 10.7 — demonstrated either by construction (Theorem 10.12 case) or empirically (ablation of §15.2 showing nonzero co-adaptation gain).
-
-**Remark 15.8 (why condition 6 is not circular).** Condition 6 requires evidence *before* the CRPS claim is taken at face value. The v3.x collapse was correctly identified empirically by the four-decimal agreement between dual-head and single-head; condition 6 formalizes that diagnosis as a precondition rather than a post-hoc explanation.
+6. The auxiliary target satisfies encoder-separation (Definition 10.7), demonstrated by construction (Theorem 10.12 case) or by an empirical ablation showing nonzero co-adaptation gain.
 
 ---
 
@@ -830,48 +976,50 @@ fitted by OLS on the training block. For $H>1$, the LHS is the mean log-RV over 
 | Component | Mathematical role | Output | Proof obligation |
 |---|---|---|---|
 | Filtration $\{\mathcal{F}_t\}$ | Information at time $t$ | — | §1.1 |
-| Feature map $\varphi_t$ | $\mathcal{F}_t$-measurable covariates | $\mathbf{x}_t\in\mathbb{R}^{12}$ | Prop. 3.9 |
+| Feature map $\varphi_t$ | $\mathcal{F}_t$-measurable covariates | $\mathbf{x}_t$ | Prop. 3.9 |
 | Forward-fill | Causal imputation | $\widetilde M_t$ | Prop. 2.6 |
 | Standardization | Train-fold affine map | $\widetilde{\mathbf{x}}_t,\widetilde\ell$ | Lemmas 4.2, 4.4 |
 | Calendar-date split | $\sigma$-algebra separation | $\theta$ | Thm. 2.9 |
 | Window $X_{a,t}$ | Local context | $\mathbb{R}^{T\times d}$ | Prop. 2.12 |
-| Encoder $\psi_\theta$ | Non-anticipative state | $\mathbb{R}^{h}$ | Lemma 6.6 |
-| Head A $f_A$ | Gaussian on log total vol | $(\mu^{\mathrm{vol}},\log\sigma^{\mathrm{vol}})$ | Cor. 7.3 |
-| Head B $f_B$ | Auxiliary target | $\widehat\ell^{\,B}$ | Cor. 8.2 |
-| CRPS | Proper score for Head A | $\mathcal{L}_A$ | Lemma 9.3 |
-| Composite | Weighted sum | $\mathcal{L}_{\mathrm{total}}$ | §9.5 |
-| Collapse theorem | Vanishing auxiliary gradient | — | Thm. 10.4 |
+| LSTM trunk | Recurrent features | $H_{\mathrm{seq}}$ | Lemma 6.11 |
+| Per-head pooling | Head-specific readout | $\psi^A,\psi^B$ | Defs. 6.3–6.4 |
+| Adapter / FiLM | Head-specific projection | $z^A,z^B$ | Defs. 6.5–6.7 |
+| Head A (flexible) | Working distribution | $\widehat P$ | Thm. 7.12 |
+| Head B (separating) | Auxiliary target | $\widehat\ell^{\,B}$ | Thm. 10.8 |
+| CRPS / pinball | Proper score | $\mathcal{L}_A$ | Lemma 7.3, Cor. 7.13 |
+| Composite | Weighted, normalized | $\mathcal{L}_{\mathrm{total}}$ | §9.1 |
+| Collapse theorem | Vanishing aux gradient | — | Thm. 10.4 |
 | Separation criterion | Necessary condition | — | Thm. 10.8 |
-| Classification | Four sources of separation | — | Thm. 10.12 |
-| Gradient flow | Co-adaptation | shared $\partial\psi/\partial\theta$ | Thm. 11.2 |
-| Potential game | Nash $=$ stationary | — | Prop. 11.7 |
-| Temperature scaling | Calibration | $t^\star$ | Prop. 12.6 |
-| Interval coverage | Reliability curve | $\kappa(\alpha)$ | Props. 12.3, 12.4 |
-| AdamW $+$ early stop | Optimization | $\theta_{k^\star}$ | Rem. 14.3 |
+| Classification | Four sources | — | Thm. 10.12 |
+| Gradient flow | Co-adaptation | — | Thm. 11.2 |
+| PCGrad | Conflict removal | $\tilde g$ | Prop. 11.8 |
+| Coverage | Reliability | $\kappa(\alpha)$ | Props. 12.3, 12.4 |
 
-The engine separates five concerns:
+The engine separates six concerns:
 
 1. **Causality** — every input is $\mathcal{F}_t$-measurable; splits are chronological and embargoed (§2–§4).
-2. **Representation** — one encoder, one latent state, consumed by both heads (§5–§6).
-3. **Estimation** — Head A minimizes a proper scoring rule; Head B minimizes a loss matched to its target's statistical character (§7–§9).
-4. **Auxiliary-target selection** — a dual-head is admissible only if the target pair is encoder-separating (§10).
-5. **Calibration and coverage** — the working distribution's reliability curve is the decision object (§12).
+2. **Representation** — one LSTM trunk, head-specific readouts (§5–§6).
+3. **Head-A distribution** — flexible working law from Gaussian to quantile (§7).
+4. **Head-B target** — encoder-separating auxiliary (§8).
+5. **Co-adaptation** — structured readouts and PCGrad (§11).
+6. **Calibration** — reliability curve as the decision object (§12).
 
 ---
 
-## 17. Errata relative to v3.0
+## 17. Errata relative to v4.0
 
-| § | v3.0 claim | Status | Correction |
+| § | v4.0 | v5.0 | Reason |
 |---|---|---|---|
-| 1.3 | Downside semivol promoted as Head-B target | **Structurally dead** | Cor. 10.5: $\ell^{\mathrm{down}}$ is a deterministic function of $\ell^{\mathrm{tot}}$ under symmetry, so the auxiliary gradient vanishes at the primary optimum |
-| 8 | Head B as $\log$ downside semivol | Superseded | §10.4: the choice of Head-B target is governed by the encoder-separation criterion |
-| 9.4 | Consistency term via $c_\star = \tfrac12\log 2$ | Still valid when defined | Rem. 9.10: applicable only when $Z_B$ is a functional of $Z_A$; not applicable for encoder-separating targets |
-| 12 | Interval coverage | Correct | Extended with temperature scaling (§12.2) |
-| — | — | New | §10: the encoder-separation criterion and the four-source classification |
-| — | — | New | §13: cross-cutting optimizations (EMA, warm restarts, learned weighting, per-head attention) |
-| 15 | Baselines: constant, HAR-RV, single-head, detached | Correct | Retained with the classification of each as a diagnostic |
+| 7 | Gaussian head only | Gaussian, Student-$t$, skew-$t$, MoG, quantile regression | Gaussian is a binding constraint on left-skewed, floor-bounded log-vol targets |
+| 8 | Downside semivol retained as design example | Replaced by three separating families (multi-horizon, jump, cross-sectional rank) | Cor. 10.5 (Theorem 10.12 applied to the functional-dependence case) |
+| 6.2 | Single readout $h_T$ | Per-head attention pooling, adapters, FiLM | The shared readout is the binding co-adaptation bottleneck |
+| 11.4 | — | PCGrad and gradient-conflict formalization | Necessary when the two targets genuinely pull the trunk apart |
+| 9.1 | $\mathcal{L}_A+\lambda_B\mathcal{L}_B+\lambda_C\mathcal{L}_C$ | Same with running-loss normalization | Scale stability; unchanged stationary set |
+| 12 | Gaussian temperature scaling | Quantile coverage + quantile reliability | Matched to the new head |
+| 15.1 | CRPS, QLIKE, $\rho$, $\rho_s$, coverage | Same plus pinball average, quantile reliability | Matched to the new head |
+| 14.4 | — | Loss normalization | Added |
 
-**Headline change.** v3.0's dual-head is formally declared structurally dead. v4.0 ships single-head as the production model and reframes dual-head as a research program governed by Theorem 10.8 with the explicit stop condition of Remark 10.17.
+**Headline changes.** (i) Head A's working law is now a design variable; quantile regression is the default. (ii) Head B's menu is fixed to three encoder-separating families. (iii) Co-adaptation is structured architecturally, not left to a scalar $\lambda_B$.
 
 ---
 
@@ -880,47 +1028,55 @@ The engine separates five concerns:
 | Symbol | Meaning |
 |---|---|
 | $\mathcal{F}_t$ | information $\sigma$-algebra at close of day $t$ |
-| $\mathcal{A}$, $N$ | asset universe and its cardinality |
-| $C_{a,t}, O_{a,t}, H_{a,t}, L_{a,t}, V_{a,t}$ | close, open, high, low, volume |
+| $\mathcal{A}, N$ | asset universe and cardinality |
+| $C,O,H,L,V$ | close, open, high, low, volume |
 | $r_{a,t}$ | one-day log return |
-| $\mathrm{RV}^{(H)}, v^{(H)}$ | realized variance, realized volatility over $H$ days |
+| $\mathrm{RV}^{(H)}, v^{(H)}$ | realized variance, volatility |
 | $\ell^{(H)}$ | log realized volatility |
-| $\ell^{\mathrm{down}}, \mathrm{RV}^{\mathrm{down}}$ | downside semivariance, log semivol |
-| $\ell^{\mathrm{bpv}}, \mathrm{BPV}$ | log bipower variation, BPV |
-| $\rho_{a,t}$ | cross-sectional rank of $\ell^{\mathrm{tot}}$ on date $d$ |
-| $\mathbf{x}_t, \widetilde{\mathbf{x}}_t$ | raw and standardized feature vectors |
-| $T, B, h, H$ | window length, batch size, hidden width, horizon |
+| $\ell^{\mathrm{down}}, \ell^{\mathrm{bpv}}$ | log downside semivol, log bipower variation |
+| $\mathrm{JV}$ | jump variation |
+| $\rho_{a,t}$ | cross-sectional rank |
+| $\mathbf{x}_t, \widetilde{\mathbf{x}}_t$ | raw, standardized features |
+| $T, B, h, H$ | window, batch, hidden width, horizon |
 | $X_{a,t}$ | input window, $\mathbb{R}^{T\times d}$ |
+| $H_{\mathrm{seq}}$ | LSTM output tensor, $T\times h$ |
 | $\psi_\theta, \psi^A_\theta, \psi^B_\theta$ | encoder and per-head readouts |
+| $z^A, z^B$ | adapter/FiLM-augmented head inputs |
 | $\theta, \theta_A, \theta_B$ | encoder, Head A, Head B parameters |
-| $\mu^{\mathrm{vol}}_{a,t}, \sigma^{\mathrm{vol}}_{a,t}$ | Head-A location and scale |
-| $\widehat\ell^{\,B}_{a,t}$ | Head-B output |
-| $\mathcal{R}_{Z}(\theta)$ | population risk of target $Z$ under encoder $\theta$ |
-| $\theta^\star_Z, \psi^\star_Z$ | single-task optimal encoder for $Z$ |
-| $\theta^\star_{AB}$ | shared-task optimal encoder |
+| $\widehat P_{a,t}$ | Head-A working distribution |
+| $\mu^{\mathrm{vol}}, \sigma^{\mathrm{vol}}$ | Gaussian-head location, scale |
+| $\widehat q(\tau)$ | Head-A quantile at level $\tau$ |
+| $\widehat F$ | Head-A working CDF |
+| $\mathcal{R}_Z(\theta)$ | population risk of target $Z$ under encoder $\theta$ |
+| $\theta^\star_Z, \psi^\star_Z$ | single-task optimum |
+| $\theta^\star_{AB}$ | shared-task optimum |
 | $c_\star$ | consistency offset in standardized units |
 | $\lambda_B, \lambda_C$ | loss weights |
 | $\gamma$ | AdamW decoupled weight decay |
-| $\eta_0, \eta_{\min}, T_0$ | initial and minimum learning rates, warm-restart period |
+| $\eta_0, \eta_{\min}, T_0$ | learning rates, warm-restart period |
 | $\beta$ | EMA decay |
-| $\mu_\ell, s_\ell$ | train-fold log-target mean and std |
-| $\mu_j, s_j$ | train-fold feature mean and std |
+| $\mu_\ell, s_\ell$ | train-fold log-target mean, std |
+| $\mu_j, s_j$ | train-fold feature mean, std |
+| $\tau, \tau_k$ | quantile levels |
+| $\rho_\tau$ | pinball loss |
+| $w_k$ | pinball weights |
+| $\varsigma$ | softplus |
 | $\alpha$ | nominal interval level |
-| $t^\star$ | calibration temperature |
 | $\kappa(\alpha)$ | empirical coverage |
-| $\mathcal{E}(\psi)$ | explained variance |
+| $t^\star$ | Gaussian temperature |
+| $\varepsilon_{\mathrm{q}}$ | worst-case quantile calibration error |
+| $g_A, g_B$ | encoder gradients of $\mathcal{L}_A,\mathcal{L}_B$ |
 | $\mathrm{sg}[\cdot]$ | stop-gradient |
 | $\epsilon$ | numerical floor |
-| $\phi, \Phi$ | standard Gaussian density and CDF |
+| $\phi, \Phi$ | standard Gaussian density, CDF |
 | $c_\sigma$ | log-$\sigma$ clamp constant |
 | $\Psi, \Theta, \mathcal{H}$ | encoder family, encoder parameter space, head family |
-| $\mathcal{P}$ | Pareto frontier of $(\mathcal{R}_{Z_A}, \mathcal{R}_{Z_B})$ |
 | $I(\cdot;\cdot)$ | mutual information |
 
 ---
 
 ## 19. Status
 
-**Single-head is the shipped model.** The v3.x result — beats HAR-RV by 7.5% CRPS and 17% QLIKE on the test block — is retained. Cross-cutting improvements of §13 (temperature scaling, EMA, feature extensions, per-head attention) apply to single-head and are pure improvements.
+**Single-head is the shipped model.** Head A default is the quantile head (Definition 7.9) with $K = 19$; parameters are trained under the pinball loss (Definition 7.10), which is a Riemann approximation to CRPS (Theorem 7.12). Cross-cutting optimizations of §13 (EMA, warm restarts, per-head attention, FiLM) apply to single-head and are pure improvements.
 
-**Dual-head is a research program.** Governed by Theorem 10.8 and the classification of Theorem 10.12. Stop condition: if multi-horizon ($H_A = 20$, $H_B = 1$) does not produce at least a 2% CRPS improvement over single-head on the test block, the hypothesis that this problem class admits a useful dual-head is rejected.
+**Dual-head is a research program.** Governed by Theorem 10.8 and the classification of Theorem 10.12. Head B is restricted to one of the three separating families of §8. Stop condition: if multi-horizon ($H_A = 20$, $H_B = 1$) does not produce at least 2% CRPS improvement over single-head on the test block, ship the single-head.
