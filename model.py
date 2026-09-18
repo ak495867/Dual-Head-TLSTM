@@ -1,24 +1,27 @@
 """
-Dual-Head TLSTM v4.0 — spec-compliant implementation.
-======================================================
-Primary head A: log realized volatility at H_A = 20
-Auxiliary head B: log realized volatility at H_B = 1
-Both distributional, both CRPS-trained.
+Dual-Head TLSTM v5.0 — Quantile Head A + Multi-Horizon Head B
+=============================================================
+Implements the three levers from "Adapting Both Heads":
 
-Theories implemented:
-  §10  Encoder-separation criterion (Def 10.7, Thm 10.8, Thm 10.12)
-       Multi-horizon is a case (H) separation.
-  §12  Interval construction + temperature scaling (Def 12.5, Prop 12.6)
-  §13  EMA, warm restarts, per-head attention pooling
-  §15  Full baseline suite and reportable-claims protocol
+  Lever A — Head A: quantile regression over ℓ^(H_A=20), K=39 quantiles.
+            Pinball loss = Riemann approximation to CRPS.
 
-Causality (unchanged):
-  §2.4  Calendar-date split with embargo T + H_max
-  §2.5  Per-asset windows
-  §4.1  Train-fold-only feature standardization
-  §4.2  Train-fold-only target standardization
+  Lever B — Head B: multi-horizon Gaussian on ℓ^(H=1) and ℓ^(H=5).
+            Satisfies Thm 10.12(H) encoder-separation.
 
-Saves: dual_head_tlstm_v4.pth
+  Lever C — Per-head attention pooling (C.3a)
+            FiLM modulation (C.3c)
+            Running-mean loss normalization (C.3e)
+
+Causality identical to v4.0:
+  §2.4 Calendar-date split + embargo T + H_max
+  §2.5 Per-asset windows (no cross-ticker)
+  §4.1 Train-fold-only feature standardization
+  §4.2 Train-fold-only target standardization
+
+Baselines: HAR-RV (H_A), single-head quantile, detached Head B, constant.
+
+Saves: dual_head_tlstm_v5.pth
 """
 
 import os, math, time, warnings
@@ -32,8 +35,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.linear_model import LinearRegression
-from scipy.stats import norm
-from scipy.optimize import minimize_scalar
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -48,7 +49,7 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {DEVICE}")
 
 # ==================================================================
-# §0  Config
+# Config
 # ==================================================================
 TRAIN_TICKERS = [
     'SPY','QQQ','IWM','DIA','MDY','RSP','VTI',
@@ -60,53 +61,48 @@ TRAIN_TICKERS = [
 START_DATE = '2012-01-01'
 END_DATE   = '2023-12-31'
 
-# --- Model ---
-T          = 30               # §5 window length
-H_A        = 20               # §1.3 primary horizon (regime-driven)
-H_B        = 1                # §1.3 auxiliary horizon (activity-driven)
-H_MAX      = max(H_A, H_B)
+T          = 30
+H_A        = 20               # primary (regime-driven)
+H_B1       = 1                # auxiliary short (activity-driven)
+H_B5       = 5                # auxiliary mid
+H_MAX      = max(H_A, H_B5)
 
-HIDDEN     = 64               # §6.1 hidden width
+HIDDEN     = 64
 NUM_LAYERS = 1
 DROPOUT    = 0.1
-C_SIGMA    = 6.0              # §7.2 log-σ clamp
 
-# --- Training ---
+# Quantile grid: uniform from 0.025 to 0.975 in steps of 0.025 → K = 39
+TAU_GRID   = np.linspace(0.025, 0.975, 39).astype(np.float32)
+K_QUANTILES= len(TAU_GRID)
+Q_INIT_BIAS= -2.0              # softplus(-2) ≈ 0.127, sum over 38 increments ≈ 4.8
+
+# Training
 BATCH_SIZE = 512
-EPOCHS     = 150              # §14.5 early-stop ceiling
-LR         = 5e-4             # §14.1 η_0
-GAMMA      = 1e-5             # §14.1 AdamW decoupled decay
-LAMBDA_B   = 0.5              # §9.5 auxiliary loss weight (scale-matched)
-PATIENCE   = 20               # §14.5
+EPOCHS     = 150
+LR         = 5e-4
+GAMMA      = 1e-5
+LAMBDA_B   = 0.5
+PATIENCE   = 20
+EMA_DECAY  = 0.999
+WARM_T0    = 40
+LOSS_MOMENTUM = 0.99           # running-mean momentum for loss normalization
 
-EMA_DECAY  = 0.999            # §13.1
-WARM_RESTART_T0 = 40          # §13.2 period
-
-# --- Targets ---
 EPS        = 1e-6
-
-# --- Paths ---
-CKPT_PATH  = 'dual_head_tlstm_v4.pth'
-CACHE_DIR  = './cache_v4'
+CKPT_PATH  = 'dual_head_tlstm_v5.pth'
+CACHE_DIR  = './cache_v5'
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ==================================================================
-# §3  Feature set (16 causal features, Def 3.8 extended)
-# ==================================================================
 FEATURE_COLS = [
-    'r1','r5','r20',
-    'vol20','vol60',
+    'r1','r5','r20','vol20','vol60',
     'ma5_ratio','ma20_ratio','rsi',
     'vol_pct','vol_imbalance',
     'gap','intraday_range',
-    'vix','vix_pct','tnx_pct',
-    'vix_term',
+    'vix','vix_pct','tnx_pct','vix_term',
 ]
-HAR_COLS = ['rv_d','rv_w','rv_m']    # for §15.3 baseline only
-
+HAR_COLS = ['rv_d','rv_w','rv_m']
 
 # ==================================================================
-# §3  Data download
+# Data
 # ==================================================================
 def download_prices(ticker, start, end):
     path = os.path.join(CACHE_DIR, f"{ticker}_{start}_{end}.parquet")
@@ -135,7 +131,6 @@ def download_macro(start, end):
         try: return pd.read_parquet(path)
         except Exception: pass
     out = {}
-    # ^VIX3M for term structure
     for sym, name in [('^VIX','vix'), ('^VIX3M','vix3m'), ('^TNX','tnx')]:
         try:
             d = yf.download(sym, start=start, end=end,
@@ -151,14 +146,7 @@ def download_macro(start, end):
     return macro
 
 
-# ==================================================================
-# §3  Feature construction
-# ==================================================================
 def compute_features(df, macro):
-    """
-    §3.1–3.7. Every coordinate is F_t-measurable (Prop 3.9).
-    Macro features use forward-fill only (Prop 2.6).
-    """
     close  = df['Close'].astype(float)
     open_  = df['Open'].astype(float)
     high   = df['High'].astype(float)
@@ -167,20 +155,14 @@ def compute_features(df, macro):
     logc   = np.log(close)
     f = pd.DataFrame(index=df.index)
 
-    # §3.1 returns
     f['r1']  = logc.diff(1)
     f['r5']  = logc.diff(5)
     f['r20'] = logc.diff(20)
-
-    # §3.2 realized vol
     f['vol20'] = f['r1'].rolling(20).std()
     f['vol60'] = f['r1'].rolling(60).std()
-
-    # §3.3 MA ratios
     f['ma5_ratio']  = close / close.rolling(5).mean()  - 1.0
     f['ma20_ratio'] = close / close.rolling(20).mean() - 1.0
 
-    # §3.4 Wilder RSI (n=14)
     delta = close.diff()
     U = delta.clip(lower=0); D = (-delta).clip(lower=0)
     n = 14
@@ -188,141 +170,182 @@ def compute_features(df, macro):
     Db = D.ewm(alpha=1.0/n, adjust=False).mean()
     f['rsi'] = 100.0 * (1.0 - 1.0 / (1.0 + Ub / (Db + 1e-9)))
 
-    # §3.5 relative volume
     f['vol_pct'] = volume / (volume.rolling(20).mean() + 1e-9) - 1.0
-
-    # §3.7 volume imbalance (MAD-normalized)
     vmed = volume.rolling(20).median()
     vmad = (volume - vmed).abs().rolling(20).median() + 1e-6
     f['vol_imbalance'] = (volume - vmed) / vmad
 
-    # §3.7 overnight gap and intraday range
     f['gap']            = np.log(open_ / close.shift(1) + 1e-9)
     f['intraday_range'] = np.log(high / (low + 1e-9))
 
-    # §3.6 macro (forward-fill only)
     macro_ff = macro.reindex(f.index, method='ffill')
     f['vix']     = macro_ff['vix']
     f['vix_pct'] = macro_ff['vix'].pct_change(1)
     f['tnx_pct'] = macro_ff['tnx'].pct_change(1)
-
-    # §3.7 term spread
     if 'vix3m' in macro_ff.columns and macro_ff['vix3m'].notna().sum() > 100:
         f['vix_term'] = macro_ff['vix'] - macro_ff['vix3m']
     else:
         f['vix_term'] = 0.0
 
-    # HAR features (used only by §15.3 baseline, not fed to LSTM)
     r2 = f['r1'] ** 2
     f['rv_d'] = r2
     f['rv_w'] = r2.rolling(5).mean()
     f['rv_m'] = r2.rolling(22).mean()
 
-    # for target construction
     f['log_ret'] = f['r1']
-
     f = f.replace([np.inf, -np.inf], np.nan).dropna()
     return f
 
 
-# ==================================================================
-# §5  Per-asset windowing (Spec 2.13, Prop 2.12)
-# ==================================================================
-def build_windows_per_asset(feat, T, H_A, H_B, asset_id):
-    """
-    X_{a,t} = feat[i-T+1 : i+1]          (T, d)
-    ℓ^{(H_A)} = log sqrt( mean_{1..H_A} r^2 )
-    ℓ^{(H_B)} = log sqrt( mean_{1..H_B} r^2 )
-    """
+def build_windows_per_asset(feat, T, H_A, H_B1, H_B5, asset_id):
     X_all   = feat[FEATURE_COLS].values
     har_all = feat[HAR_COLS].values
     log_ret = feat['log_ret'].values
     dates   = feat.index
     n       = len(feat)
-    H_MAX   = max(H_A, H_B)
+    H_MAX   = max(H_A, H_B5)
     out = []
     for i in range(T - 1, n - H_MAX):
-        Xw    = X_all[i - T + 1 : i + 1].astype(np.float32)
-        harw  = har_all[i].astype(np.float32)
-        r_a   = log_ret[i + 1 : i + 1 + H_A]
-        r_b   = log_ret[i + 1 : i + 1 + H_B]
-        v_a   = float(np.sqrt(np.mean(r_a * r_a)))
-        v_b   = float(np.sqrt(np.mean(r_b * r_b)))
+        Xw   = X_all[i - T + 1 : i + 1].astype(np.float32)
+        harw = har_all[i].astype(np.float32)
+        rA   = log_ret[i + 1 : i + 1 + H_A]
+        rB1  = log_ret[i + 1 : i + 1 + H_B1]
+        rB5  = log_ret[i + 1 : i + 1 + H_B5]
         out.append({
             'X': Xw, 'har': harw,
-            'v_A': v_a, 'v_B': v_b,
-            'l_A': float(np.log(v_a + EPS)),
-            'l_B': float(np.log(v_b + EPS)),
+            'l_A':  float(np.log(np.sqrt(np.mean(rA * rA)) + EPS)),
+            'l_B1': float(np.log(np.sqrt(np.mean(rB1 * rB1)) + EPS)),
+            'l_B5': float(np.log(np.sqrt(np.mean(rB5 * rB5)) + EPS)),
+            'v_A':  float(np.sqrt(np.mean(rA * rA))),
             'date': dates[i], 'asset': asset_id,
         })
     return out
 
 
 # ==================================================================
-# §6  Encoder with per-head attention pooling (Def 6.3, 6.4)
+# Model
 # ==================================================================
 class AttentionPool(nn.Module):
-    """α_i = softmax(q^T h_i); ψ = Σ α_i h_i. Def 6.3."""
+    """Per-head attention over the time axis (Def 6.3, 6.4)."""
     def __init__(self, hidden):
         super().__init__()
         self.q = nn.Linear(hidden, 1)
 
-    def forward(self, out):                       # (B, T, H)
-        w = torch.softmax(self.q(out), dim=1)     # (B, T, 1)
-        return (w * out).sum(dim=1)               # (B, H)
+    def forward(self, out):
+        w = torch.softmax(self.q(out), dim=1)
+        return (w * out).sum(dim=1)
+
+
+class FiLM(nn.Module):
+    """Feature-wise linear modulation. Initialised to identity (γ=1, β=0)."""
+    def __init__(self, hidden):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(hidden))
+        self.beta  = nn.Parameter(torch.zeros(hidden))
+
+    def forward(self, x):
+        return self.gamma * x + self.beta
+
+
+def softplus_quantiles(z, q_bias=-2.0):
+    """
+    z: (B, K)
+    q[:, 0] = z[:, 0]                        (base, unbounded)
+    q[:, k] = q[:, k-1] + softplus(z[:, k] + q_bias)
+    Guarantees q[:, 0] < q[:, 1] < ... < q[:, K-1].
+    """
+    base = z[:, :1]
+    inc  = F.softplus(z[:, 1:] + q_bias)        # (B, K-1)
+    q    = torch.cat([base, base + torch.cumsum(inc, dim=1)], dim=1)
+    return q
 
 
 class DualHeadTLSTM(nn.Module):
     """
-    §6.1 shared LSTM. §6.4 per-head attention pooling.
-    §7.2 Head A: Gaussian on ℓ^{(H_A)}.
-    §8.1 Head B: Gaussian on ℓ^{(H_B)}.
+    Head A: K quantiles of ℓ^(H_A).       (Lever A)
+    Head B: Gaussian on ℓ^(H_B1), ℓ^(H_B5). (Lever B)
+    Per-head attention + FiLM.             (Lever C: 3a, 3c)
     """
     def __init__(self, n_features, hidden=64, num_layers=1,
-                 dropout=0.1, c_sigma=6.0):
+                 dropout=0.1, k_quantiles=39, q_bias=-2.0):
         super().__init__()
-        self.c_sigma = c_sigma
+        self.k_quantiles = k_quantiles
+        self.q_bias = q_bias
         self.lstm = nn.LSTM(n_features, hidden, num_layers,
                             batch_first=True,
                             dropout=dropout if num_layers > 1 else 0.0)
         self.drop = nn.Dropout(dropout)
 
-        # Per-head readouts (Def 6.4)
+        # Lever C.3a: per-head attention pools
         self.pool_a = AttentionPool(hidden)
         self.pool_b = AttentionPool(hidden)
 
-        # §7.2 Head A: (μ_A, log σ_A)
-        self.head_a = nn.Sequential(
-            nn.Linear(hidden, 64), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(64, 2))
-        # §8.1 Head B: (μ_B, log σ_B)
+        # Lever C.3c: per-head FiLM
+        self.film_a = FiLM(hidden)
+        self.film_b = FiLM(hidden)
+
+        # Head A: quantile head (Lever A)
+        self.head_a_trunk = nn.Sequential(
+            nn.Linear(hidden, 64), nn.GELU(), nn.Dropout(dropout))
+        self.head_a_last  = nn.Linear(64, k_quantiles)
+
+        # Head B: two Gaussian horizons (Lever B)
         self.head_b = nn.Sequential(
-            nn.Linear(hidden, 64), nn.GELU(),
-            nn.Dropout(dropout), nn.Linear(64, 2))
+            nn.Linear(hidden, 64), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(64, 4))     # (μ1, log σ1, μ5, log σ5)
+
+        self._init_bias()
+
+    def _init_bias(self):
+        # Quantile last-layer bias: base at 0, increments at q_bias
+        with torch.no_grad():
+            self.head_a_last.bias.fill_(self.q_bias)
+            self.head_a_last.bias[0] = 0.0
 
     def forward(self, x, detach_b=False):
         out, _ = self.lstm(x)                     # (B, T, H)
         out = self.drop(out)
 
+        # Head A path
         ha = self.pool_a(out)
-        a  = self.head_a(ha)
-        mu_a    = a[:, 0]
-        log_s_a = torch.clamp(a[:, 1], -self.c_sigma, self.c_sigma)
+        ha = self.film_a(ha)
+        za = self.head_a_trunk(ha)
+        za = self.head_a_last(za)                 # (B, K)
+        q  = softplus_quantiles(za, self.q_bias)  # (B, K) sorted
 
-        hb_in = out.detach() if detach_b else out
-        hb = self.pool_b(hb_in)
-        b  = self.head_b(hb)
-        mu_b    = b[:, 0]
-        log_s_b = torch.clamp(b[:, 1], -self.c_sigma, self.c_sigma)
-
-        return mu_a, log_s_a, mu_b, log_s_b
+        # Head B path
+        out_b = out.detach() if detach_b else out
+        hb = self.pool_b(out_b)
+        hb = self.film_b(hb)
+        zb = self.head_b(hb)                      # (B, 4)
+        mu1, log_s1 = zb[:, 0], zb[:, 1]
+        mu5, log_s5 = zb[:, 2], zb[:, 3]
+        log_s1 = torch.clamp(log_s1, -6.0, 6.0)
+        log_s5 = torch.clamp(log_s5, -6.0, 6.0)
+        return q, mu1, log_s1, mu5, log_s5
 
 
 # ==================================================================
-# §9  Losses
+# Losses
 # ==================================================================
+def pinball_loss(q, y, taus):
+    """
+    q: (B, K) sorted quantiles
+    y: (B,)   target
+    taus: (K,) quantile levels
+    Returns per-sample pinball loss (B,).
+    """
+    u = y.unsqueeze(-1) - q                  # (B, K)
+    tau = taus.unsqueeze(0)                  # (1, K)
+    return torch.max(tau * u, (tau - 1.0) * u)   # (B, K)
+
+
+def crps_from_quantiles(q, y, taus):
+    """Riemann approximation: CRPS ≈ 2 * mean_k ρ_τk(q_k, y)."""
+    return 2.0 * pinball_loss(q, y, taus).mean(dim=1)     # (B,)
+
+
 def crps_gaussian_scalar(y, mu, log_sigma):
-    """§9.2 Gaussian CRPS closed form."""
     sigma = torch.exp(log_sigma).clamp(min=1e-6)
     z   = (y - mu) / sigma
     phi = torch.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
@@ -330,16 +353,35 @@ def crps_gaussian_scalar(y, mu, log_sigma):
     return sigma * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
 
 
-def composite_loss(mu_a, ls_a, mu_b, ls_b, y_a, y_b, lam_B):
-    """§9.5  L_total = L_A + λ_B · L_B.  λ_C = 0 (multi-horizon is not functional)."""
-    L_A = crps_gaussian_scalar(y_a, mu_a, ls_a).mean()
-    L_B = crps_gaussian_scalar(y_b, mu_b, ls_b).mean()
-    total = L_A + lam_B * L_B
-    return total, float(L_A), float(L_B)
+def composite_loss(q, mu1, ls1, mu5, ls5,
+                   yA, yB1, yB5, taus):
+    """Returns L_A, L_B1, L_B5, L_B."""
+    L_A  = crps_from_quantiles(q, yA, taus).mean()
+    L_B1 = crps_gaussian_scalar(yB1, mu1, ls1).mean()
+    L_B5 = crps_gaussian_scalar(yB5, mu5, ls5).mean()
+    L_B  = 0.5 * (L_B1 + L_B5)
+    return L_A, L_B1, L_B5, L_B
 
 
 # ==================================================================
-# §13.1  EMA
+# Running mean (Lever C.3e)
+# ==================================================================
+class RunningMean:
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.value = None
+
+    def update(self, x):
+        x = float(x)
+        if self.value is None:
+            self.value = x
+        else:
+            self.value = self.momentum * self.value + (1 - self.momentum) * x
+        return self.value
+
+
+# ==================================================================
+# EMA (Lever C in spirit; §13.1)
 # ==================================================================
 class EMA:
     def __init__(self, model, decay=0.999):
@@ -361,42 +403,56 @@ class EMA:
 
 
 # ==================================================================
-# §14  Training
+# Training
 # ==================================================================
 def train_model(model, train_loader, val_loader, lam_B,
                 epochs, lr, gamma, patience,
-                use_ema=True, detach_b=False,
-                warm_restart_t0=40):
+                use_ema=True, detach_b=False, warm_t0=40,
+                loss_norm=True, verbose=True):
     opt   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=gamma)
     sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        opt, T_0=warm_restart_t0, T_mult=1, eta_min=lr * 0.05)
-
+        opt, T_0=warm_t0, T_mult=1, eta_min=lr * 0.05)
     ema = EMA(model, EMA_DECAY) if use_ema else None
 
+    running_A = RunningMean(LOSS_MOMENTUM)
+    running_B = RunningMean(LOSS_MOMENTUM)
+
+    taus = torch.tensor(TAU_GRID, device=DEVICE)
+
     best_val, best_state, wait = float('inf'), None, 0
-    history = {'train': [], 'val': [], 'L_A': [], 'L_B': []}
+    history = {'train': [], 'val': [], 'L_A': [], 'L_B': [],
+               'rA': [], 'rB': []}
 
     for ep in range(epochs):
         # --- train ---
         model.train()
         tot = tot_a = tot_b = n = 0.0
-        for xb, ya, yb in train_loader:
-            xb, ya, yb = xb.to(DEVICE), ya.to(DEVICE), yb.to(DEVICE)
-            mu_a, ls_a, mu_b, ls_b = model(xb, detach_b=detach_b)
-            loss, la, lb = composite_loss(mu_a, ls_a, mu_b, ls_b,
-                                          ya, yb, lam_B)
+        for xb, yA, yB1, yB5 in train_loader:
+            xb, yA, yB1, yB5 = (xb.to(DEVICE), yA.to(DEVICE),
+                                yB1.to(DEVICE), yB5.to(DEVICE))
+            q, mu1, ls1, mu5, ls5 = model(xb, detach_b=detach_b)
+            L_A, _, _, L_B = composite_loss(q, mu1, ls1, mu5, ls5,
+                                            yA, yB1, yB5, taus)
+            # Lever C.3e: normalize by running means
+            rA = running_A.update(L_A.item())
+            rB = running_B.update(L_B.item())
+            if loss_norm and rA > 0 and rB > 0:
+                loss = L_A / rA + lam_B * L_B / rB
+            else:
+                loss = L_A + lam_B * L_B
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            if ema is not None:
-                ema.update(model)
+            if ema is not None: ema.update(model)
             tot += loss.item() * len(xb)
-            tot_a += la * len(xb); tot_b += lb * len(xb); n += len(xb)
+            tot_a += float(L_A) * len(xb); tot_b += float(L_B) * len(xb)
+            n += len(xb)
         train_loss = tot / n
         train_LA = tot_a / n; train_LB = tot_b / n
         history['train'].append(train_loss)
         history['L_A'].append(train_LA)
         history['L_B'].append(train_LB)
+        history['rA'].append(rA); history['rB'].append(rB)
 
         # --- validate on EMA if enabled ---
         backup = None
@@ -407,17 +463,21 @@ def train_model(model, train_loader, val_loader, lam_B,
         model.eval()
         tot, n = 0.0, 0
         with torch.no_grad():
-            for xb, ya, yb in val_loader:
-                xb, ya, yb = xb.to(DEVICE), ya.to(DEVICE), yb.to(DEVICE)
-                mu_a, ls_a, mu_b, ls_b = model(xb, detach_b=detach_b)
-                loss, _, _ = composite_loss(mu_a, ls_a, mu_b, ls_b,
-                                            ya, yb, lam_B)
+            for xb, yA, yB1, yB5 in val_loader:
+                xb, yA, yB1, yB5 = (xb.to(DEVICE), yA.to(DEVICE),
+                                    yB1.to(DEVICE), yB5.to(DEVICE))
+                q, mu1, ls1, mu5, ls5 = model(xb, detach_b=detach_b)
+                L_A, _, _, L_B = composite_loss(q, mu1, ls1, mu5, ls5,
+                                                yA, yB1, yB5, taus)
+                if loss_norm and rA > 0 and rB > 0:
+                    loss = L_A / rA + lam_B * L_B / rB
+                else:
+                    loss = L_A + lam_B * L_B
                 tot += loss.item() * len(xb); n += len(xb)
         val_loss = tot / n
         history['val'].append(val_loss)
         if backup is not None:
             model.load_state_dict(backup)
-
         sched.step()
 
         improved = val_loss < best_val - 1e-5
@@ -429,12 +489,13 @@ def train_model(model, train_loader, val_loader, lam_B,
         else:
             wait += 1
 
-        if ep % 10 == 0 or improved:
-            print(f"  ep {ep+1:3d} | train={train_loss:.4f} "
-                  f"(LA={train_LA:.4f} LB={train_LB:.4f}) "
-                  f"val={val_loss:.4f}{' *' if improved else ''}")
+        if verbose and (ep % 10 == 0 or improved):
+            print(f"  ep {ep+1:3d} | "
+                  f"train_norm={train_loss:.4f}  "
+                  f"(L_A={train_LA:.4f} L_B={train_LB:.4f})  "
+                  f"val_norm={val_loss:.4f}{' *' if improved else ''}")
         if wait >= patience:
-            print(f"  early stop ep {ep+1}")
+            if verbose: print(f"  early stop ep {ep+1}")
             break
 
     if best_state is not None:
@@ -447,75 +508,82 @@ def train_model(model, train_loader, val_loader, lam_B,
 # ==================================================================
 @torch.no_grad()
 def predict(model, X, detach_b=False, bs=2048):
-    """Returns (μ_A, σ_A, μ_B, σ_B) all in standardized target units."""
     model.eval()
     Xt = torch.as_tensor(X, dtype=torch.float32)
-    mu_as, sig_as, mu_bs, sig_bs = [], [], [], []
+    qs, m1s, s1s, m5s, s5s = [], [], [], [], []
     for i in range(0, len(Xt), bs):
         xb = Xt[i:i+bs].to(DEVICE)
-        mu_a, ls_a, mu_b, ls_b = model(xb, detach_b=detach_b)
-        mu_as.append(mu_a.cpu().numpy())
-        sig_as.append(torch.exp(ls_a).cpu().numpy())
-        mu_bs.append(mu_b.cpu().numpy())
-        sig_bs.append(torch.exp(ls_b).cpu().numpy())
-    return (np.concatenate(mu_as), np.concatenate(sig_as),
-            np.concatenate(mu_bs), np.concatenate(sig_bs))
+        q, mu1, ls1, mu5, ls5 = model(xb, detach_b=detach_b)
+        qs.append(q.cpu().numpy())
+        m1s.append(mu1.cpu().numpy()); s1s.append(torch.exp(ls1).cpu().numpy())
+        m5s.append(mu5.cpu().numpy()); s5s.append(torch.exp(ls5).cpu().numpy())
+    return (np.concatenate(qs), np.concatenate(m1s), np.concatenate(s1s),
+            np.concatenate(m5s), np.concatenate(s5s))
 
 
 # ==================================================================
-# §15  Metrics
+# Metrics
 # ==================================================================
 def qlike(l_true, mu_pred):
     u = l_true - mu_pred
     return float((np.exp(u) - u - 1.0).mean())
 
 
-def gauss_coverage(l_true, mu, sigma, level):
-    z = norm.ppf(0.5 + level / 2.0)
-    lo, hi = mu - z * sigma, mu + z * sigma
-    return float(((l_true >= lo) & (l_true <= hi)).mean())
+def quantile_coverage(y, q, level):
+    """Coverage of [q_lo, q_hi] where lo = (1-level)/2, hi = 1 - lo."""
+    lo_tau = (1.0 - level) / 2.0
+    hi_tau = 1.0 - lo_tau
+    idx_lo = int(np.argmin(np.abs(TAU_GRID - lo_tau)))
+    idx_hi = int(np.argmin(np.abs(TAU_GRID - hi_tau)))
+    lo = q[:, idx_lo]; hi = q[:, idx_hi]
+    return float(((y >= lo) & (y <= hi)).mean())
 
 
-def full_metrics(l_true, mu_pred, sigma_pred, v_true, label):
-    """§15.1 metrics suite."""
-    crps = float(crps_gaussian_scalar(
-        torch.tensor(l_true, dtype=torch.float32),
-        torch.tensor(mu_pred, dtype=torch.float32),
-        torch.log(torch.tensor(sigma_pred, dtype=torch.float32).clamp(min=1e-6))
-    ).mean())
-    pearson  = float(np.corrcoef(np.exp(mu_pred), v_true)[0, 1])
-    spearman = float(pd.Series(mu_pred).corr(pd.Series(l_true),
-                                             method='spearman'))
-    ql       = qlike(l_true, mu_pred)
-    mse_log  = float(np.mean((mu_pred - l_true) ** 2))
-    cov80    = gauss_coverage(l_true, mu_pred, sigma_pred, 0.80)
-    cov95    = gauss_coverage(l_true, mu_pred, sigma_pred, 0.95)
-    print(f"  {label:<28} CRPS={crps:.4f}  ρ={pearson:.4f}  ρ_s={spearman:.4f}  "
+def metrics_from_quantiles(y, q, v_true, label):
+    """All metrics derived from the quantile vector q (B, K)."""
+    taus = TAU_GRID
+    # CRPS via Riemann (using unstandardized y, q)
+    q_t = torch.tensor(q, dtype=torch.float32)
+    y_t = torch.tensor(y, dtype=torch.float32)
+    tau_t = torch.tensor(taus, dtype=torch.float32)
+    crps = float(crps_from_quantiles(q_t, y_t, tau_t).mean())
+    # median (τ=0.5) as point forecast
+    idx_med = int(np.argmin(np.abs(taus - 0.5)))
+    med = q[:, idx_med]
+    pearson  = float(np.corrcoef(np.exp(med), v_true)[0, 1])
+    spearman = float(pd.Series(med).corr(pd.Series(y), method='spearman'))
+    ql       = qlike(y, med)
+    mse_log  = float(np.mean((med - y) ** 2))
+    cov80    = quantile_coverage(y, q, 0.80)
+    cov95    = quantile_coverage(y, q, 0.95)
+    print(f"  {label:<30} CRPS={crps:.4f}  ρ={pearson:.4f}  ρ_s={spearman:.4f}  "
           f"QLIKE={ql:.4f}  MSE_ℓ={mse_log:.4f}  cov80={cov80:.3f}  cov95={cov95:.3f}")
     return dict(crps=crps, pearson=pearson, spearman=spearman,
                 qlike=ql, mse_log=mse_log, cov80=cov80, cov95=cov95)
 
 
-# ==================================================================
-# §12.2  Temperature scaling
-# ==================================================================
-def fit_sigma_temperature(mu_val, sig_val, l_val):
-    """
-    §12.2. Minimize squared coverage error over {80%, 95%} on validation.
-    """
-    def loss(t):
-        s = sig_val * t
-        return (gauss_coverage(l_val, mu_val, s, 0.80) - 0.80) ** 2 \
-             + (gauss_coverage(l_val, mu_val, s, 0.95) - 0.95) ** 2
-    res = minimize_scalar(loss, bounds=(0.5, 2.5), method='bounded')
-    return float(res.x)
+def metrics_gaussian(y, mu, sigma, v_true, label):
+    """For baselines that are Gaussian (HAR-RV, single-horizon)."""
+    crps = float(crps_gaussian_scalar(
+        torch.tensor(y, dtype=torch.float32),
+        torch.tensor(mu, dtype=torch.float32),
+        torch.log(torch.tensor(sigma, dtype=torch.float32).clamp(min=1e-6))
+    ).mean())
+    pearson  = float(np.corrcoef(np.exp(mu), v_true)[0, 1])
+    spearman = float(pd.Series(mu).corr(pd.Series(y), method='spearman'))
+    ql       = qlike(y, mu)
+    mse_log  = float(np.mean((mu - y) ** 2))
+    from scipy.stats import norm
+    z80 = norm.ppf(0.90); z95 = norm.ppf(0.975)
+    cov80 = float(((y >= mu - z80*sigma) & (y <= mu + z80*sigma)).mean())
+    cov95 = float(((y >= mu - z95*sigma) & (y <= mu + z95*sigma)).mean())
+    print(f"  {label:<30} CRPS={crps:.4f}  ρ={pearson:.4f}  ρ_s={spearman:.4f}  "
+          f"QLIKE={ql:.4f}  MSE_ℓ={mse_log:.4f}  cov80={cov80:.3f}  cov95={cov95:.3f}")
+    return dict(crps=crps, pearson=pearson, spearman=spearman,
+                qlike=ql, mse_log=mse_log, cov80=cov80, cov95=cov95)
 
 
-# ==================================================================
-# §15.3  HAR-RV baseline
-# ==================================================================
 def fit_har_baseline(train_har, train_l, test_har):
-    """§15.3 Corsi 2009. Log-RV regression on daily/weekly/monthly RV."""
     X_tr = np.log(train_har + EPS)
     X_te = np.log(test_har + EPS)
     har = LinearRegression().fit(X_tr, train_l)
@@ -530,16 +598,19 @@ def fit_har_baseline(train_har, train_l, test_har):
 # ==================================================================
 def main():
     print("=" * 78)
-    print("Dual-Head TLSTM v4.0 — encoder-separation test")
+    print("Dual-Head TLSTM v5.0 — Quantile Head A + Multi-Horizon Head B")
     print("=" * 78)
     print(f"Config:")
-    print(f"  T          = {T}")
-    print(f"  H_A        = {H_A}  (primary: regime-driven)")
-    print(f"  H_B        = {H_B}  (auxiliary: activity-driven)")
-    print(f"  hidden     = {HIDDEN}, layers = {NUM_LAYERS}")
-    print(f"  λ_B        = {LAMBDA_B}")
-    print(f"  EMA decay  = {EMA_DECAY}")
-    print(f"  Warm T0    = {WARM_RESTART_T0}")
+    print(f"  T            = {T}")
+    print(f"  H_A          = {H_A}  (primary)")
+    print(f"  H_B1, H_B5   = {H_B1}, {H_B5}  (auxiliary)")
+    print(f"  hidden       = {HIDDEN}")
+    print(f"  K quantiles  = {K_QUANTILES}")
+    print(f"  λ_B          = {LAMBDA_B}")
+    print(f"  loss_norm    = True   (Lever C.3e)")
+    print(f"  EMA, warm T0 = {EMA_DECAY}, {WARM_T0}")
+
+    taus_t = torch.tensor(TAU_GRID, device=DEVICE)
 
     # ---------- [1] Data ----------
     print("\n[1/8] Downloading data...")
@@ -558,10 +629,10 @@ def main():
     print("\n[2/8] Building per-asset windows...")
     all_w = []
     for tk, feat in assets.items():
-        all_w.extend(build_windows_per_asset(feat, T, H_A, H_B, tk))
+        all_w.extend(build_windows_per_asset(feat, T, H_A, H_B1, H_B5, tk))
     print(f"  Total windows: {len(all_w)}")
 
-    # ---------- [3] Calendar-date split (§2.4) ----------
+    # ---------- [3] Split ----------
     print("\n[3/8] Calendar-date split with embargo T+H_max...")
     master = sorted(assets['SPY'].index)
     m = len(master)
@@ -580,219 +651,199 @@ def main():
     print(f"  Test starts {test_start_date.date()}")
     print(f"  Windows: train={len(train_w)}, val={len(val_w)}, test={len(test_w)}")
 
-    train_X    = np.stack([w['X']    for w in train_w]).astype(np.float32)
-    val_X      = np.stack([w['X']    for w in val_w]).astype(np.float32)
-    test_X     = np.stack([w['X']    for w in test_w]).astype(np.float32)
-    train_har  = np.stack([w['har']  for w in train_w]).astype(np.float32)
-    test_har   = np.stack([w['har']  for w in test_w]).astype(np.float32)
+    train_X   = np.stack([w['X'] for w in train_w]).astype(np.float32)
+    val_X     = np.stack([w['X'] for w in val_w]).astype(np.float32)
+    test_X    = np.stack([w['X'] for w in test_w]).astype(np.float32)
+    train_har = np.stack([w['har'] for w in train_w]).astype(np.float32)
+    test_har  = np.stack([w['har'] for w in test_w]).astype(np.float32)
 
-    train_lA   = np.array([w['l_A'] for w in train_w], dtype=np.float32)
-    val_lA     = np.array([w['l_A'] for w in val_w],   dtype=np.float32)
-    test_lA    = np.array([w['l_A'] for w in test_w],  dtype=np.float32)
+    def arr(ws, k): return np.array([w[k] for w in ws], dtype=np.float32)
+    train_lA, val_lA, test_lA   = arr(train_w,'l_A'),  arr(val_w,'l_A'),  arr(test_w,'l_A')
+    train_lB1, val_lB1, test_lB1 = arr(train_w,'l_B1'), arr(val_w,'l_B1'), arr(test_w,'l_B1')
+    train_lB5, val_lB5, test_lB5 = arr(train_w,'l_B5'), arr(val_w,'l_B5'), arr(test_w,'l_B5')
+    train_vA, test_vA             = arr(train_w,'v_A'), arr(test_w,'v_A')
 
-    train_lB   = np.array([w['l_B'] for w in train_w], dtype=np.float32)
-    val_lB     = np.array([w['l_B'] for w in val_w],   dtype=np.float32)
-    test_lB    = np.array([w['l_B'] for w in test_w],  dtype=np.float32)
-
-    train_vA   = np.array([w['v_A'] for w in train_w], dtype=np.float32)
-    test_vA    = np.array([w['v_A'] for w in test_w],  dtype=np.float32)
-    train_vB   = np.array([w['v_B'] for w in train_w], dtype=np.float32)
-    test_vB    = np.array([w['v_B'] for w in test_w],  dtype=np.float32)
-
-    # ---------- [4] Target standardization (§4.2) ----------
+    # ---------- [4] Target standardization ----------
     print("\n[4/8] Train-fold target standardization...")
-    mu_lA = float(train_lA.mean()); sd_lA = float(train_lA.std() + 1e-8)
-    mu_lB = float(train_lB.mean()); sd_lB = float(train_lB.std() + 1e-8)
-    print(f"  ℓ^(H_A={H_A}): mean={mu_lA:.4f} std={train_lA.std():.4f}")
-    print(f"  ℓ^(H_B={H_B}):  mean={mu_lB:.4f} std={train_lB.std():.4f}")
+    muA = float(train_lA.mean());  sdA = float(train_lA.std()  + 1e-8)
+    muB1= float(train_lB1.mean()); sdB1= float(train_lB1.std()+ 1e-8)
+    muB5= float(train_lB5.mean()); sdB5= float(train_lB5.std()+ 1e-8)
+    print(f"  ℓ^(H_A={H_A}): mean={muA:.4f}  std={train_lA.std():.4f}")
+    print(f"  ℓ^(H_B1={H_B1}): mean={muB1:.4f}  std={train_lB1.std():.4f}")
+    print(f"  ℓ^(H_B5={H_B5}): mean={muB5:.4f}  std={train_lB5.std():.4f}")
 
-    train_lA_z = (train_lA - mu_lA) / sd_lA
-    val_lA_z   = (val_lA   - mu_lA) / sd_lA
-    test_lA_z  = (test_lA  - mu_lA) / sd_lA
-    train_lB_z = (train_lB - mu_lB) / sd_lB
-    val_lB_z   = (val_lB   - mu_lB) / sd_lB
-    test_lB_z  = (test_lB  - mu_lB) / sd_lB
+    train_lA_z = (train_lA - muA) / sdA; val_lA_z = (val_lA - muA) / sdA
+    test_lA_z  = (test_lA  - muA) / sdA
+    train_lB1_z = (train_lB1 - muB1) / sdB1; val_lB1_z = (val_lB1 - muB1) / sdB1
+    test_lB1_z  = (test_lB1  - muB1) / sdB1
+    train_lB5_z = (train_lB5 - muB5) / sdB5; val_lB5_z = (val_lB5 - muB5) / sdB5
+    test_lB5_z  = (test_lB5  - muB5) / sdB5
 
-    # Feature scaler (train-fold-only, Lemma 4.2)
     mu_f = train_X.mean(axis=(0, 1)).astype(np.float32)
     sd_f = (train_X.std(axis=(0, 1)) + 1e-8).astype(np.float32)
     train_X = (train_X - mu_f) / sd_f
     val_X   = (val_X   - mu_f) / sd_f
     test_X  = (test_X  - mu_f) / sd_f
 
-    # ---------- Loaders ----------
     train_loader = DataLoader(
         TensorDataset(torch.tensor(train_X),
                       torch.tensor(train_lA_z),
-                      torch.tensor(train_lB_z)),
+                      torch.tensor(train_lB1_z),
+                      torch.tensor(train_lB5_z)),
         batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(
         TensorDataset(torch.tensor(val_X),
                       torch.tensor(val_lA_z),
-                      torch.tensor(val_lB_z)),
+                      torch.tensor(val_lB1_z),
+                      torch.tensor(val_lB5_z)),
         batch_size=BATCH_SIZE, shuffle=False)
 
-    # ---------- [5] HAR-RV baseline (§15.3) ----------
-    print("\n[5/8] Fitting HAR-RV baseline (§15.3)...")
-    har, har_test_lA_pred, har_sigma_z = fit_har_baseline(
+    # ---------- [5] HAR baseline ----------
+    print("\n[5/8] Fitting HAR-RV baseline for H_A...")
+    har, har_test_lA_pred_z, har_sigma_z = fit_har_baseline(
         train_har, train_lA_z, test_har)
-    # In original units, for the metrics table
-    har_test_lA_pred_o = har_test_lA_pred * sd_lA + mu_lA
-    har_sigma_o        = har_sigma_z * sd_lA
+    har_test_lA_pred_o = har_test_lA_pred_z * sdA + muA
+    har_sigma_o        = har_sigma_z * sdA
     print(f"  HAR coefs: {har.coef_}, intercept={har.intercept_:.4f}")
     print(f"  HAR train R²: {har.score(np.log(train_har + EPS), train_lA_z):.4f}")
 
     # ---------- [6] Train main model ----------
-    print(f"\n[6/8] Training main Dual-Head TLSTM v4.0...")
+    print(f"\n[6/8] Training main Dual-Head TLSTM v5.0...")
     torch.manual_seed(SEED); np.random.seed(SEED)
     model = DualHeadTLSTM(len(FEATURE_COLS), HIDDEN, NUM_LAYERS,
-                          DROPOUT, C_SIGMA).to(DEVICE)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Params: {n_params:,}")
+                          DROPOUT, K_QUANTILES, Q_INIT_BIAS).to(DEVICE)
+    print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
     t0 = time.time()
     hist_main, best_val = train_model(
         model, train_loader, val_loader, LAMBDA_B,
         EPOCHS, LR, GAMMA, PATIENCE,
-        use_ema=True, detach_b=False,
-        warm_restart_t0=WARM_RESTART_T0)
-    print(f"  Time: {(time.time()-t0)/60:.1f} min | best val = {best_val:.4f}")
-
-    # ---------- [7] σ-temperature scaling (§12.2) ----------
-    print("\n[7/8] Fitting σ-calibration temperatures on validation...")
-    val_muA, val_sigA, val_muB, val_sigB = predict(model, val_X)
-    # validation metrics in standardized units for the calibration objective
-    t_A = fit_sigma_temperature(val_muA, val_sigA, val_lA_z)
-    t_B = fit_sigma_temperature(val_muB, val_sigB, val_lB_z)
-    print(f"  t_A (H={H_A}) = {t_A:.4f}")
-    print(f"  t_B (H={H_B})  = {t_B:.4f}")
+        use_ema=True, detach_b=False, warm_t0=WARM_T0, loss_norm=True)
+    print(f"  Time: {(time.time()-t0)/60:.1f} min | best val_norm = {best_val:.4f}")
 
     # ---------- Test predictions ----------
-    te_muA_z, te_sigA_z, te_muB_z, te_sigB_z = predict(model, test_X)
-    # unstandardize
-    te_muA_o  = te_muA_z * sd_lA + mu_lA
-    te_sigA_o = te_sigA_z * sd_lA
-    te_muB_o  = te_muB_z * sd_lB + mu_lB
-    te_sigB_o = te_sigB_z * sd_lB
-    te_sigA_cal = te_sigA_o * t_A
-    te_sigB_cal = te_sigB_o * t_B
+    q_test_z, tm1_z, ts1, tm5_z, ts5 = predict(model, test_X)
+    q_val_z,  vm1_z, vs1, vm5_z, vs5 = predict(model, val_X)
 
-    # ---------- Baselines (§15.2) ----------
-    print("\n  Training single-head baseline (λ_B=0)...")
+    # Unstandardize
+    q_test_o = q_test_z * sdA + muA
+    q_val_o  = q_val_z  * sdA + muA
+    # Head B unscale
+    ts1_o = ts1 * sdB1; ts5_o = ts5 * sdB5
+    tm1_o = tm1_z * sdB1 + muB1; tm5_o = tm5_z * sdB5 + muB5
+
+    # ---------- [7] Baselines ----------
+    print("\n  Training single-head baseline (quantile, λ_B=0)...")
     torch.manual_seed(SEED); np.random.seed(SEED)
     m_sh = DualHeadTLSTM(len(FEATURE_COLS), HIDDEN, NUM_LAYERS,
-                         DROPOUT, C_SIGMA).to(DEVICE)
+                         DROPOUT, K_QUANTILES, Q_INIT_BIAS).to(DEVICE)
     train_model(m_sh, train_loader, val_loader, 0.0,
                 EPOCHS, LR, GAMMA, PATIENCE,
-                use_ema=True, detach_b=False,
-                warm_restart_t0=WARM_RESTART_T0)
-    sh_muA_z, sh_sigA_z, _, _ = predict(m_sh, test_X)
-    sh_muA_o  = sh_muA_z * sd_lA + mu_lA
-    sh_sigA_o = sh_sigA_z * sd_lA
-    _, sh_valSig_z, _, _ = predict(m_sh, val_X)
-    t_sh = fit_sigma_temperature(sh_muA_z if False else
-                                 (sh_muA_z * 1.0), sh_valSig_z, val_lA_z)
-    sh_sigA_cal = sh_sigA_o * t_sh
+                use_ema=True, detach_b=False, warm_t0=WARM_T0,
+                loss_norm=False, verbose=True)
+    q_sh_test_z, _, _, _, _ = predict(m_sh, test_X)
+    q_sh_test_o = q_sh_test_z * sdA + muA
 
     print("  Training detached Head B baseline...")
     torch.manual_seed(SEED); np.random.seed(SEED)
     m_dt = DualHeadTLSTM(len(FEATURE_COLS), HIDDEN, NUM_LAYERS,
-                         DROPOUT, C_SIGMA).to(DEVICE)
+                         DROPOUT, K_QUANTILES, Q_INIT_BIAS).to(DEVICE)
     train_model(m_dt, train_loader, val_loader, LAMBDA_B,
                 EPOCHS, LR, GAMMA, PATIENCE,
-                use_ema=True, detach_b=True,
-                warm_restart_t0=WARM_RESTART_T0)
-    dt_muA_z, dt_sigA_z, _, _ = predict(m_dt, test_X, detach_b=True)
-    dt_muA_o  = dt_muA_z * sd_lA + mu_lA
-    dt_sigA_o = dt_sigA_z * sd_lA
-    _, dt_valSig_z, _, _ = predict(m_dt, val_X, detach_b=True)
-    t_dt = fit_sigma_temperature(dt_muA_z, dt_valSig_z, val_lA_z)
-    dt_sigA_cal = dt_sigA_o * t_dt
+                use_ema=True, detach_b=True, warm_t0=WARM_T0,
+                loss_norm=True, verbose=True)
+    q_dt_test_z, _, _, _, _ = predict(m_dt, test_X, detach_b=True)
+    q_dt_test_o = q_dt_test_z * sdA + muA
 
-    # Constant baseline (§15.2 Def 15.2)
-    const_mu  = np.full(len(test_lA), mu_lA)
-    const_sig = np.full(len(test_lA), float(train_lA.std()))
+    # Constant baseline: median = train mean, ±2σ for intervals
+    const_med = np.full(len(test_lA), muA)
+    # Build a Gaussian quantile vector for the constant predictor
+    from scipy.stats import norm
+    const_q = np.zeros((len(test_lA), K_QUANTILES), dtype=np.float32)
+    for k, tau in enumerate(TAU_GRID):
+        const_q[:, k] = muA + norm.ppf(tau) * float(train_lA.std())
 
     # ---------- [8] Evaluate ----------
-    print("\n[8/8] Test metrics (§15.1):")
-    print("=" * 112)
-    print(f"{'Model (primary H=' + str(H_A) + ')':<34} {'CRPS':>8} "
-          f"{'Pearson':>9} {'Spear':>8} {'QLIKE':>8} {'MSE_ℓ':>8} "
-          f"{'cov80':>7} {'cov95':>7}")
-    print("-" * 112)
-
+    print("\n[8/8] Test metrics (Head A primary H={})".format(H_A))
+    print("=" * 118)
+    print(f"{'Model':<30} {'CRPS':>8} {'Pearson':>9} {'Spear':>8} "
+          f"{'QLIKE':>8} {'MSE_ℓ':>8} {'cov80':>7} {'cov95':>7}")
+    print("-" * 118)
     res = {}
-    res['Main dual-head (cal)']   = full_metrics(
-        test_lA, te_muA_o, te_sigA_cal, test_vA, 'Main dual-head (cal)')
-    res['Main dual-head (raw)']   = full_metrics(
-        test_lA, te_muA_o, te_sigA_o,   test_vA, 'Main dual-head (raw)')
-    res['Single-head (cal)']      = full_metrics(
-        test_lA, sh_muA_o, sh_sigA_cal, test_vA, 'Single-head (cal)')
-    res['Detached Head B (cal)']  = full_metrics(
-        test_lA, dt_muA_o, dt_sigA_cal, test_vA, 'Detached Head B (cal)')
-    res['HAR-RV']                 = full_metrics(
-        test_lA, har_test_lA_pred_o, np.full(len(test_lA), har_sigma_o),
-        test_vA, 'HAR-RV')
-    res['Constant']               = full_metrics(
-        test_lA, const_mu, const_sig, test_vA, 'Constant')
-    print("=" * 112)
+    res['Main dual-head']    = metrics_from_quantiles(test_lA, q_test_o, test_vA, 'Main dual-head')
+    res['Single-head']       = metrics_from_quantiles(test_lA, q_sh_test_o, test_vA, 'Single-head')
+    res['Detached Head B']   = metrics_from_quantiles(test_lA, q_dt_test_o, test_vA, 'Detached Head B')
+    res['HAR-RV']            = metrics_gaussian(test_lA, har_test_lA_pred_o,
+                                                np.full(len(test_lA), har_sigma_o),
+                                                test_vA, 'HAR-RV')
+    res['Constant']          = metrics_from_quantiles(test_lA, const_q, test_vA, 'Constant')
+    print("=" * 118)
 
-    # ---------- Auxiliary head evaluation ----------
-    print(f"\nAuxiliary head (H_B={H_B}) test metrics:")
-    aux_res = full_metrics(test_lB, te_muB_o, te_sigB_cal, test_vB,
-                           f'Head B (H={H_B}, cal)')
+    # ---------- Auxiliary horizons (Head B) ----------
+    print(f"\nAuxiliary head diagnostics:")
+    for h, m, s, ly in [(H_B1, tm1_o, ts1_o, test_lB1),
+                        (H_B5, tm5_o, ts5_o, test_lB5)]:
+        crps_h = float(crps_gaussian_scalar(
+            torch.tensor(ly, dtype=torch.float32),
+            torch.tensor(m, dtype=torch.float32),
+            torch.log(torch.tensor(s, dtype=torch.float32).clamp(min=1e-6))
+        ).mean())
+        rho_h = float(np.corrcoef(np.exp(m), np.exp(ly))[0, 1])
+        print(f"  H_B={h:>2}  CRPS={crps_h:.4f}  ρ={rho_h:.4f}")
 
-    # ---------- Delta vs Single-head (the encoder-separation test) ----------
+    # ---------- Encoder-separation verdict ----------
     print("\n" + "-" * 70)
-    print("ENCODER-SEPARATION TEST (Thm 10.8) — delta vs Single-head")
+    print("ENCODER-SEPARATION TEST — Main vs Single-head")
     print("-" * 70)
-    base_crps  = res['Single-head (cal)']['crps']
-    base_qlike = res['Single-head (cal)']['qlike']
-    for name in ['Main dual-head (cal)', 'HAR-RV',
-                 'Detached Head B (cal)', 'Constant']:
-        dc = res[name]['crps']  - base_crps
-        dq = res[name]['qlike'] - base_qlike
+    base_crps = res['Single-head']['crps']
+    for name in ['Main dual-head', 'Detached Head B', 'HAR-RV', 'Constant']:
+        dc = res[name]['crps'] - base_crps
         rel = 100.0 * dc / base_crps if base_crps > 0 else 0
         verdict = ''
-        if name == 'Main dual-head (cal)':
-            if rel < -2.0:   verdict = '  ✓ PASS — dual-head beats single by ≥2%'
-            elif rel < -0.3: verdict = '  ~ marginal gain (<2%)'
-            else:            verdict = '  ✗ FAIL — no encoder separation'
-        print(f"  {name:<28} ΔCRPS={dc:+.4f} ({rel:+.2f}%)  ΔQLIKE={dq:+.4f}{verdict}")
+        if name == 'Main dual-head':
+            if rel < -2.0:   verdict = '  PASS — dual-head ≥2% better'
+            elif rel < -0.3: verdict = '  ~ marginal (<2%)'
+            else:            verdict = '  FAIL — no separation'
+        print(f"  {name:<20} ΔCRPS={dc:+.4f} ({rel:+.2f}%){verdict}")
 
-    # ---------- Abstention diagnostic (σ̂ separates easy/hard) ----------
-    print("\nAbstention diagnostic on σ̂_A (primary head):")
-    tau_sig = float(np.quantile(te_sigA_cal, 0.80))
-    act = te_sigA_cal <= tau_sig
-    print(f"  Coverage at τ_σ (q80) = {act.mean():.3f}")
-    if act.sum() > 10:
-        c1 = full_metrics(test_lA[act],  te_muA_o[act],
-                          te_sigA_cal[act], test_vA[act], 'Confident')
-        c2 = full_metrics(test_lA[~act], te_muA_o[~act],
-                          te_sigA_cal[~act], test_vA[~act], 'Uncertain')
-        if c1['crps'] < c2['crps']:
-            print(f"  ✓ σ̂_A separates easy from hard windows")
+    # ---------- σ̂ separation diagnostic (quantile-based) ----------
+    print("\nσ̂-width decile diagnostic (Head A interval width at 80%):")
+    widths = q_test_o[:, int(np.argmin(np.abs(TAU_GRID - 0.90)))] \
+           - q_test_o[:, int(np.argmin(np.abs(TAU_GRID - 0.10)))]
+    order  = np.argsort(widths)
+    deciles = np.array_split(order, 10)
+    dec_crps = []
+    for d in deciles:
+        c = float(crps_from_quantiles(
+            torch.tensor(q_test_o[d], dtype=torch.float32),
+            torch.tensor(test_lA[d], dtype=torch.float32),
+            torch.tensor(TAU_GRID, dtype=torch.float32)).mean())
+        dec_crps.append(c)
+    print(f"  Narrowest decile CRPS: {dec_crps[0]:.4f}")
+    print(f"  Widest   decile CRPS: {dec_crps[-1]:.4f}")
+    if dec_crps[0] < dec_crps[-1]:
+        print(f"  ✓ Interval width separates easy from hard windows")
 
     # ---------- Save ----------
     torch.save({
         'state_dict': model.state_dict(),
         'config': {
-            'n_features': len(FEATURE_COLS),
-            'hidden': HIDDEN, 'num_layers': NUM_LAYERS,
-            'dropout': DROPOUT, 'c_sigma': C_SIGMA,
-            'T': T, 'H_A': H_A, 'H_B': H_B,
-            'lambda_B': LAMBDA_B, 'ema_decay': EMA_DECAY,
+            'n_features': len(FEATURE_COLS), 'hidden': HIDDEN,
+            'num_layers': NUM_LAYERS, 'dropout': DROPOUT,
+            'T': T, 'H_A': H_A, 'H_B1': H_B1, 'H_B5': H_B5,
+            'k_quantiles': K_QUANTILES, 'tau_grid': TAU_GRID.tolist(),
+            'q_bias': Q_INIT_BIAS, 'lambda_B': LAMBDA_B,
+            'ema_decay': EMA_DECAY,
         },
         'feature_cols': FEATURE_COLS,
-        'mu_f': mu_f, 'sd_f': sd_f, 'eps': EPS,
-        'mu_lA': mu_lA, 'sd_lA': sd_lA,
-        'mu_lB': mu_lB, 'sd_lB': sd_lB,
-        'tau_a': t_A, 'tau_b': t_B,
+        'mu_f': mu_f, 'sd_f': sd_f,
+        'muA': muA, 'sdA': sdA,
+        'muB1': muB1, 'sdB1': sdB1,
+        'muB5': muB5, 'sdB5': sdB5,
         'har_coef': har.coef_, 'har_intercept': har.intercept_,
-        'har_sigma_orig': har_sigma_o,
+        'har_sigma_o': har_sigma_o,
         'history': hist_main,
         'test_metrics': {k: {kk: float(vv) for kk, vv in v.items()}
                          for k, v in res.items()},
-        'aux_metrics': {k: float(v) for k, v in aux_res.items()},
     }, CKPT_PATH)
     print(f"\nSaved: {CKPT_PATH}")
 
@@ -801,61 +852,51 @@ def main():
     fig = plt.figure(figsize=(20, 12))
     gs  = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.30)
 
-    # Loss curves
+    # 1. Loss curves
     ax = fig.add_subplot(gs[0, 0])
-    ax.plot(hist_main['train'], label='total train')
-    ax.plot(hist_main['val'],   label='total val')
-    ax.plot(hist_main['L_A'],   label=f'L_A (H={H_A})', alpha=0.6)
-    ax.plot(hist_main['L_B'],   label=f'L_B (H={H_B})', alpha=0.6)
-    ax.set(xlabel='epoch', ylabel='loss', title='Loss curves')
-    ax.legend(); ax.grid(alpha=0.3)
+    ax.plot(hist_main['train'], label='total train (normalized)')
+    ax.plot(hist_main['val'],   label='total val (normalized)')
+    ax.plot(hist_main['L_A'],   label='L_A raw', alpha=0.6)
+    ax.plot(hist_main['L_B'],   label='L_B raw', alpha=0.6)
+    ax.set(xlabel='epoch', ylabel='loss', title='Loss curves (v5.0)')
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
-    # Predicted vs realized (primary)
+    # 2. Quantile fan at a sample point
     ax = fig.add_subplot(gs[0, 1])
-    ax.scatter(te_muA_o, test_lA, s=2, alpha=0.2)
-    lo = min(te_muA_o.min(), test_lA.min())
-    hi = max(te_muA_o.max(), test_lA.max())
-    ax.plot([lo, hi], [lo, hi], 'r--', lw=1)
-    ax.set(xlabel=f'μ̂_A (pred log-vol, H={H_A})',
-           ylabel=f'ℓ^(H={H_A}) realized',
-           title=f'Primary head scatter (ρ={res["Main dual-head (cal)"]["pearson"]:.3f})')
-    ax.grid(alpha=0.3)
+    sample_idx = np.random.RandomState(0).choice(len(test_lA), 200, replace=False)
+    for i in sample_idx[:30]:
+        ax.plot(TAU_GRID, q_test_o[i], color='steelblue', alpha=0.3, lw=0.5)
+    ax.plot(TAU_GRID, const_q[0], 'k--', lw=1.5, label='Constant baseline')
+    ax.set(xlabel='τ quantile level', ylabel='quantile value (log-vol)',
+           title='Quantile fan (30 test samples)')
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
-    # Coverage: raw vs calibrated
+    # 3. Coverage from quantiles
     ax = fig.add_subplot(gs[0, 2])
-    levels = np.array([0.10, 0.20, 0.30, 0.50, 0.70, 0.80, 0.90, 0.95])
-    covs_raw = [gauss_coverage(test_lA, te_muA_o, te_sigA_o,   lv) for lv in levels]
-    covs_cal = [gauss_coverage(test_lA, te_muA_o, te_sigA_cal, lv) for lv in levels]
-    ax.plot(levels, covs_raw, 'o--', color='tab:red',  label='Raw σ̂')
-    ax.plot(levels, covs_cal, 's-',  color='tab:blue', label='Calibrated σ̂')
+    levels = np.linspace(0.05, 0.95, 19)
+    covs_main = [quantile_coverage(test_lA, q_test_o, lv) for lv in levels]
+    covs_sh   = [quantile_coverage(test_lA, q_sh_test_o, lv) for lv in levels]
+    covs_const= [quantile_coverage(test_lA, const_q, lv) for lv in levels]
+    ax.plot(levels, covs_main, 's-',  label='Main dual-head')
+    ax.plot(levels, covs_sh,   'o--', label='Single-head')
+    ax.plot(levels, covs_const,'x:',  label='Constant')
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.4, label='Ideal')
     ax.set(xlabel='Nominal coverage', ylabel='Empirical coverage',
-           title=f'Reliability curve — Head A (H={H_A})')
-    ax.legend(); ax.grid(alpha=0.3)
+           title='Reliability curve (Head A, from quantiles)')
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
-    # CRPS by σ decile
+    # 4. CRPS by interval-width decile
     ax = fig.add_subplot(gs[1, 0])
-    order = np.argsort(te_sigA_cal)
-    deciles = np.array_split(order, 10)
-    crps_per_decile = []
-    for d in deciles:
-        c = crps_gaussian_scalar(
-            torch.tensor(test_lA[d], dtype=torch.float32),
-            torch.tensor(te_muA_o[d], dtype=torch.float32),
-            torch.log(torch.tensor(te_sigA_cal[d],
-                                   dtype=torch.float32).clamp(min=1e-6))
-        ).mean().item()
-        crps_per_decile.append(c)
-    ax.bar(range(1, 11), crps_per_decile, color='tab:purple')
-    ax.set(xlabel='predicted σ̂_A decile (1=confident)', ylabel='CRPS',
-           title='CRPS vs σ̂_A decile')
+    ax.bar(range(1, 11), dec_crps, color='tab:purple')
+    ax.set(xlabel='Interval-width decile (1=narrow)',
+           ylabel='CRPS', title='CRPS vs σ̂-width decile')
     ax.grid(alpha=0.3)
 
-    # Model comparison table
+    # 5. Model comparison table
     ax = fig.add_subplot(gs[1, 1]); ax.axis('off')
     rows = []
-    for name in ['Main dual-head (cal)', 'Single-head (cal)',
-                 'Detached Head B (cal)', 'HAR-RV', 'Constant']:
+    for name in ['Main dual-head', 'Single-head', 'Detached Head B',
+                 'HAR-RV', 'Constant']:
         r = res[name]
         rows.append([name, f"{r['crps']:.4f}", f"{r['pearson']:.4f}",
                      f"{r['qlike']:.4f}", f"{r['cov80']:.3f}"])
@@ -865,31 +906,31 @@ def main():
     tbl.auto_set_font_size(False); tbl.set_fontsize(8); tbl.scale(1.1, 1.5)
     ax.set_title(f'Test metrics (H_A={H_A})', pad=10)
 
-    # Per-asset Pearson
+    # 6. Per-asset Pearson
     ax = fig.add_subplot(gs[1, 2])
     asset_ids = [w['asset'] for w in test_w]
     pers = []
     for a in sorted(set(asset_ids)):
         m = np.array(asset_ids) == a
-        p = float(np.corrcoef(np.exp(te_muA_o[m]), test_vA[m])[0, 1])
+        med = q_test_o[m, int(np.argmin(np.abs(TAU_GRID - 0.5)))]
+        p = float(np.corrcoef(np.exp(med), test_vA[m])[0, 1])
         pers.append((a, p))
     pers.sort(key=lambda x: x[1])
-    names = [p[0] for p in pers]
-    vals  = [p[1] for p in pers]
+    names = [p[0] for p in pers]; vals = [p[1] for p in pers]
     colors = ['tab:red' if v < 0.5 else 'tab:green' for v in vals]
     ax.barh(names, vals, color=colors)
     ax.axvline(0.5, ls='--', color='gray')
-    ax.set(xlabel=f'Pearson ρ(exp(μ̂_A), v^(H={H_A}))',
+    ax.set(xlabel=f'Pearson ρ(exp(median), v^(H={H_A}))',
            title='Per-asset Pearson correlation')
     ax.grid(alpha=0.3)
 
     plt.suptitle(
-        f'Dual-Head TLSTM v4.0 — {len(assets)} assets, T={T}, '
-        f'H_A={H_A} (primary), H_B={H_B} (aux), λ_B={LAMBDA_B}',
+        f'Dual-Head TLSTM v5.0 — quantile Head A (K={K_QUANTILES}) + '
+        f'multi-horizon Head B ({H_B1},{H_B5}), primary H_A={H_A}',
         fontsize=13, y=0.995)
-    plt.savefig('dual_head_tlstm_v4.png', dpi=120, bbox_inches='tight')
+    plt.savefig('dual_head_tlstm_v5.png', dpi=120, bbox_inches='tight')
     plt.close()
-    print("Saved: dual_head_tlstm_v4.png")
+    print("Saved: dual_head_tlstm_v5.png")
 
 
 if __name__ == "__main__":
